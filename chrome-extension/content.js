@@ -1,5 +1,6 @@
 const STORAGE_PREFIX = "caption-replacer:";
 const HIDE_STYLE_ID = "yt-srt-hide-native-captions-style";
+const HIDE_SETTINGS_STYLE_ID = "yt-srt-hide-settings-subtitle-style";
 const DEFAULT_SERVER_URL = "ws://localhost:8080";
 
 let currentVideoId = null;
@@ -224,6 +225,39 @@ function showNativeCaptions() {
   document.getElementById(HIDE_STYLE_ID)?.remove();
 }
 
+function enableSettingsSubtitleHiding() {
+  if (document.getElementById(HIDE_SETTINGS_STYLE_ID)) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = HIDE_SETTINGS_STYLE_ID;
+  style.textContent = `
+    .ytp-menuitem[data-caption-replacer-hidden="true"] {
+      display: none !important;
+    }
+  `;
+  document.documentElement.appendChild(style);
+}
+
+function disableSettingsSubtitleHiding() {
+  document.getElementById(HIDE_SETTINGS_STYLE_ID)?.remove();
+
+  for (const item of document.querySelectorAll('[data-caption-replacer-hidden]')) {
+    item.removeAttribute("data-caption-replacer-hidden");
+  }
+}
+
+function markSubtitlesSettingsMenuItems() {
+  for (const item of document.querySelectorAll(".ytp-menuitem")) {
+    const label = item.querySelector(".ytp-menuitem-label");
+
+    if (label && /subtitles|closed captions/i.test(label.textContent)) {
+      item.setAttribute("data-caption-replacer-hidden", "true");
+    }
+  }
+}
+
 function insertCuesChronologically(existing, incoming) {
   const combined = [...existing, ...incoming];
 
@@ -265,9 +299,7 @@ function renderLoop() {
     return;
   }
 
-  const captionsEnabledInUi = areCaptionsEnabledInUi();
-
-  if (captionsEnabledInUi) {
+  if (areCaptionsEnabledInUi()) {
     hideNativeCaptions();
   } else {
     showNativeCaptions();
@@ -305,6 +337,8 @@ function startRendering() {
   }
 
   hideNativeCaptions();
+  enableSettingsSubtitleHiding();
+  markSubtitlesSettingsMenuItems();
 
   if (!rafId) {
     rafId = requestAnimationFrame(renderLoop);
@@ -323,6 +357,10 @@ function stopRendering() {
 function clearCustomCaptions() {
   cues = [];
   showNativeCaptions();
+  disableSettingsSubtitleHiding();
+  stopRendering();
+
+  generationState = { active: false, status: "", cueCount: 0, error: "" };
 
   if (textEl) {
     textEl.textContent = "";
@@ -591,6 +629,10 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 const observer = new MutationObserver(() => {
   if (cues.length && overlayEl && !overlayEl.isConnected) {
     ensureOverlay();
+  }
+
+  if (document.getElementById(HIDE_SETTINGS_STYLE_ID)) {
+    markSubtitlesSettingsMenuItems();
   }
 });
 
