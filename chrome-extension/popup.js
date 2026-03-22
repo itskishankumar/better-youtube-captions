@@ -55,13 +55,7 @@ function setControlsEnabled(enabled) {
 }
 
 function updateGenerateButton(generating) {
-  if (generating) {
-    generateButtonEl.textContent = "Stop";
-    generateButtonEl.classList.add("generating");
-  } else {
-    generateButtonEl.textContent = "Generate Captions";
-    generateButtonEl.classList.remove("generating");
-  }
+  generateButtonEl.disabled = generating;
 }
 
 async function getActiveTab() {
@@ -104,9 +98,10 @@ async function ensureContentScriptReady() {
   });
 }
 
-async function loadStoredFileInfo(videoId) {
+async function hasStoredCaptions(videoId) {
   const stored = await chrome.storage.local.get(getStorageKey(videoId));
-  return stored[getStorageKey(videoId)] || null;
+  const value = stored[getStorageKey(videoId)];
+  return typeof value === "string" && value.length > 0;
 }
 
 async function loadServerUrl() {
@@ -146,9 +141,6 @@ function applyStatus(state) {
   } else if (state.status === "done_cached") {
     setStreamStatus(`Loaded from cache — ${state.cueCount} cues.`);
     setStatus("Loaded from cache", "success");
-  } else if (state.status === "stopped") {
-    setStreamStatus(`Stopped — ${state.cueCount} cues received.`);
-    setStatus("");
   } else if (state.status === "error") {
     setStreamStatus("");
     setStatus(state.error || "Server error.", "error");
@@ -195,9 +187,6 @@ async function startGeneration() {
   });
 
   if (response?.active) {
-    await sendMessageToActiveTab({ type: "CAPTION_REPLACER_STOP_GENERATION" });
-    updateGenerateButton(false);
-    setStreamStatus("");
     return;
   }
 
@@ -232,24 +221,17 @@ async function handleFileSelection(event) {
       throw new Error("The selected SRT file is empty.");
     }
 
-    const payload = {
-      fileName: file.name,
-      srtText,
-      updatedAt: Date.now()
-    };
-
     await chrome.storage.local.set({
-      [getStorageKey(currentVideoId)]: payload
+      [getStorageKey(currentVideoId)]: srtText
     });
 
     await sendMessageToActiveTab({
       type: "CAPTION_REPLACER_APPLY_SRT",
       videoId: currentVideoId,
-      srtText,
-      fileName: file.name
+      srtText
     });
 
-    fileMetaEl.textContent = `Stored file: ${file.name} (${new Date(payload.updatedAt).toLocaleString()})`;
+    fileMetaEl.textContent = "Captions stored for this video.";
     setStatus(`Applied ${file.name} to the current video.`, "success");
   } catch (error) {
     setStatus(error.message || "Failed to read the selected SRT file.", "error");
@@ -274,7 +256,7 @@ async function handleClear() {
     videoId: currentVideoId
   });
 
-  fileMetaEl.textContent = "No SRT selected for this video.";
+  fileMetaEl.textContent = "No captions for this video.";
   setStreamStatus("");
   setStatus("Cleared custom captions for this video.");
 }
@@ -306,13 +288,10 @@ async function refreshPopupState() {
   setControlsEnabled(true);
   await ensureContentScriptReady();
 
-  const existing = await loadStoredFileInfo(currentVideoId);
-
-  if (existing) {
-    const timestamp = new Date(existing.updatedAt).toLocaleString();
-    fileMetaEl.textContent = `Stored: ${existing.fileName} (${timestamp})`;
+  if (await hasStoredCaptions(currentVideoId)) {
+    fileMetaEl.textContent = "Captions stored for this video.";
   } else {
-    fileMetaEl.textContent = "No SRT selected for this video.";
+    fileMetaEl.textContent = "No captions for this video.";
   }
 
   const status = await sendMessageToActiveTab({

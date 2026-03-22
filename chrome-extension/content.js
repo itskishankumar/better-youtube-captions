@@ -396,14 +396,14 @@ async function loadStoredCaptionsForCurrentVideo() {
   }
 
   const stored = await chrome.storage.local.get(getStorageKey(videoId));
-  const entry = stored[getStorageKey(videoId)];
+  const srtText = stored[getStorageKey(videoId)];
 
-  if (!entry || typeof entry.srtText !== "string") {
+  if (typeof srtText !== "string" || !srtText) {
     clearCustomCaptions();
     return;
   }
 
-  applySrtText(entry.srtText, videoId);
+  applySrtText(srtText, videoId);
 }
 
 // ---------------------------------------------------------------------------
@@ -435,18 +435,12 @@ async function saveGeneratedSrt() {
     .map((cue, i) => `${i + 1}\n${formatTimestamp(cue.start)} --> ${formatTimestamp(cue.end)}\n${cue.text}`)
     .join("\n\n") + "\n";
 
-  await chrome.storage.local.set({
-    [getStorageKey(videoId)]: {
-      fileName: "generated-captions.srt",
-      srtText,
-      updatedAt: Date.now()
-    }
-  });
+  await chrome.storage.local.set({ [getStorageKey(videoId)]: srtText });
 }
 
 function startGeneration(serverUrl) {
   if (generationWs) {
-    stopGeneration();
+    return;
   }
 
   const videoId = getCurrentVideoId();
@@ -535,16 +529,6 @@ function startGeneration(serverUrl) {
   });
 }
 
-function stopGeneration() {
-  if (generationWs) {
-    generationWs.close();
-    generationWs = null;
-  }
-
-  generationState.active = false;
-  generationState.status = generationState.cueCount > 0 ? "stopped" : "";
-}
-
 // ---------------------------------------------------------------------------
 // Message handler
 // ---------------------------------------------------------------------------
@@ -562,12 +546,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
 
-    if (message?.type === "CAPTION_REPLACER_STOP_GENERATION") {
-      stopGeneration();
-      sendResponse({ ok: true });
-      return true;
-    }
-
     if (message?.type === "CAPTION_REPLACER_GET_STATUS") {
       sendResponse({ ok: true, ...generationState });
       return true;
@@ -581,7 +559,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     if (message?.type === "CAPTION_REPLACER_CLEAR_SRT") {
       if (message.videoId === getCurrentVideoId()) {
-        stopGeneration();
         clearCustomCaptions();
       }
 
@@ -619,12 +596,27 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     return;
   }
 
-  if (change.newValue?.srtText) {
-    applySrtText(change.newValue.srtText, videoId);
+  if (typeof change.newValue === "string" && change.newValue) {
+    applySrtText(change.newValue, videoId);
   } else {
     clearCustomCaptions();
   }
 });
+
+function handleVideoChange() {
+  const newVideoId = getCurrentVideoId();
+
+  if (newVideoId === currentVideoId) {
+    return;
+  }
+
+  clearCustomCaptions();
+  void loadStoredCaptionsForCurrentVideo();
+}
+
+document.addEventListener("yt-navigate-finish", handleVideoChange);
+
+window.addEventListener("popstate", handleVideoChange);
 
 const observer = new MutationObserver(() => {
   if (cues.length && overlayEl && !overlayEl.isConnected) {
@@ -634,6 +626,8 @@ const observer = new MutationObserver(() => {
   if (document.getElementById(HIDE_SETTINGS_STYLE_ID)) {
     markSubtitlesSettingsMenuItems();
   }
+
+  handleVideoChange();
 });
 
 observer.observe(document.documentElement, { childList: true, subtree: true });

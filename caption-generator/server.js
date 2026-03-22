@@ -37,40 +37,10 @@ function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type"
   });
   res.end(JSON.stringify(payload));
-}
-
-function parseJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let rawBody = "";
-
-    req.on("data", (chunk) => {
-      rawBody += chunk;
-
-      if (rawBody.length > 1_000_000) {
-        reject(new Error("Request body too large."));
-        req.destroy();
-      }
-    });
-
-    req.on("end", () => {
-      if (!rawBody) {
-        resolve({});
-        return;
-      }
-
-      try {
-        resolve(JSON.parse(rawBody));
-      } catch {
-        reject(new Error("Request body must be valid JSON."));
-      }
-    });
-
-    req.on("error", reject);
-  });
 }
 
 function isValidHttpUrl(value) {
@@ -102,13 +72,6 @@ function extractVideoId(videoUrl) {
 
 function createRequestId() {
   return `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-}
-
-function getNonEmptyLines(value) {
-  return value
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
 }
 
 function sleep(ms) {
@@ -450,392 +413,6 @@ function insertSegmentsChronologically(existingSegments, newSegments) {
 }
 
 // ---------------------------------------------------------------------------
-// Audio download (batch)
-// ---------------------------------------------------------------------------
-
-async function runYtDlp(videoUrl, requestId) {
-  const outputTemplate = `${requestId}.%(ext)s`;
-  const args = [
-    "-f",
-    "bestaudio",
-    "-P",
-    __dirname,
-    "-o",
-    outputTemplate,
-    "--print",
-    "after_move:filepath",
-    "--no-progress",
-    videoUrl
-  ];
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(BINARY_PATH, args, {
-      cwd: __dirname
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", (error) => {
-      reject(new Error(`Failed to start yt-dlp_macos: ${error.message}`));
-    });
-
-    child.on("close", async (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(
-            `yt-dlp_macos exited with code ${code}.\n${stderr || stdout || "No output returned."}`
-          )
-        );
-        return;
-      }
-
-      const outputLines = getNonEmptyLines(stdout);
-      const candidatePath = outputLines[outputLines.length - 1];
-
-      if (!candidatePath) {
-        reject(new Error("yt-dlp_macos did not report the downloaded audio file path."));
-        return;
-      }
-
-      const audioPath = path.isAbsolute(candidatePath)
-        ? candidatePath
-        : path.join(__dirname, candidatePath);
-
-      try {
-        await fs.access(audioPath);
-      } catch {
-        reject(new Error(`Downloaded audio file was not found at ${audioPath}.`));
-        return;
-      }
-
-      resolve({ audioPath });
-    });
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Batch transcription (existing REST flow)
-// ---------------------------------------------------------------------------
-
-async function writeSrtFile(audioPath, srtContent) {
-  const srtPath = path.join(
-    path.dirname(audioPath),
-    `${path.basename(audioPath, path.extname(audioPath))}.srt`
-  );
-
-  await fs.writeFile(srtPath, srtContent, "utf8");
-
-  return srtPath;
-}
-
-async function convertAudioToRealtimePcm(audioPath, pcmPath) {
-  const args = [
-    "-y",
-    "-i",
-    audioPath,
-    "-vn",
-    "-ac",
-    "1",
-    "-ar",
-    String(REALTIME_SAMPLE_RATE),
-    "-f",
-    "s16le",
-    "-acodec",
-    "pcm_s16le",
-    pcmPath
-  ];
-
-  return new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", args, {
-      cwd: __dirname
-    });
-
-    let stderr = "";
-
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", (error) => {
-      reject(new Error(`Failed to start ffmpeg: ${error.message}`));
-    });
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(`ffmpeg exited with code ${code} while converting audio.\n${stderr}`)
-        );
-        return;
-      }
-
-      resolve();
-    });
-  });
-}
-
-async function removeFileIfExists(filePath) {
-  try {
-    await fs.unlink(filePath);
-  } catch (error) {
-    if (!error || error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-}
-
-async function transcribeAudioRealtime(audioPath) {
-  const apiKey = process.env.ELEVENLABS_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("ELEVENLABS_API_KEY is not set.");
-  }
-
-  const srtPath = path.join(
-    path.dirname(audioPath),
-    `${path.basename(audioPath, path.extname(audioPath))}.srt`
-  );
-  const pcmPath = path.join(
-    path.dirname(audioPath),
-    `${path.basename(audioPath, path.extname(audioPath))}.${createRequestId()}.pcm`
-  );
-
-  await writeSrtFile(audioPath, "");
-
-  try {
-    log("batch", "converting audio to PCM...");
-    await convertAudioToRealtimePcm(audioPath, pcmPath);
-    const pcmBuffer = await fs.readFile(pcmPath);
-    log("batch", `PCM ready — ${(pcmBuffer.length / 1024).toFixed(0)} KB`);
-
-    if (pcmBuffer.length === 0) {
-      throw new Error("PCM conversion produced an empty file.");
-    }
-
-    const websocketUrl = new URL(ELEVENLABS_REALTIME_ENDPOINT);
-    websocketUrl.searchParams.set("model_id", ELEVENLABS_REALTIME_MODEL_ID);
-    websocketUrl.searchParams.set("audio_format", "pcm_16000");
-    websocketUrl.searchParams.set("include_timestamps", "true");
-    websocketUrl.searchParams.set("commit_strategy", "vad");
-    websocketUrl.searchParams.set("vad_silence_threshold_secs", ".5");
-    websocketUrl.searchParams.set("vad_threshold", "0.4");
-    websocketUrl.searchParams.set("min_speech_duration_ms", "100");
-    websocketUrl.searchParams.set("min_silence_duration_ms", "100");
-
-    return await new Promise((resolve, reject) => {
-      const ws = new WebSocket(websocketUrl, {
-        headers: {
-          "xi-api-key": apiKey
-        }
-      });
-
-      const segments = [];
-      let writeChain = Promise.resolve();
-      let finalized = false;
-      let finishTimer = null;
-      let finalCommitSent = false;
-      let sessionStarted = false;
-
-      function clearFinishTimer() {
-        if (finishTimer) {
-          clearTimeout(finishTimer);
-          finishTimer = null;
-        }
-      }
-
-      function scheduleFinish() {
-        if (!finalCommitSent || finalized) {
-          return;
-        }
-
-        clearFinishTimer();
-        finishTimer = setTimeout(() => {
-          ws.close();
-        }, REALTIME_FINALIZE_IDLE_MS);
-      }
-
-      function finish(result) {
-        if (finalized) {
-          return;
-        }
-
-        finalized = true;
-        clearFinishTimer();
-
-        writeChain
-          .then(() => resolve(result))
-          .catch(reject);
-      }
-
-      function fail(error) {
-        if (finalized) {
-          return;
-        }
-
-        finalized = true;
-        clearFinishTimer();
-        reject(error);
-      }
-
-      async function sendAudioChunks() {
-        for (let offset = 0; offset < pcmBuffer.length; offset += REALTIME_CHUNK_BYTES) {
-          const chunk = pcmBuffer.subarray(offset, offset + REALTIME_CHUNK_BYTES);
-
-          ws.send(
-            JSON.stringify({
-              message_type: "input_audio_chunk",
-              audio_base_64: chunk.toString("base64"),
-              commit: false,
-              sample_rate: REALTIME_SAMPLE_RATE
-            })
-          );
-
-          await sleep(REALTIME_SEND_DELAY_MS);
-        }
-
-        finalCommitSent = true;
-        ws.send(
-          JSON.stringify({
-            message_type: "input_audio_chunk",
-            audio_base_64: "",
-            commit: true,
-            sample_rate: REALTIME_SAMPLE_RATE
-          })
-        );
-        scheduleFinish();
-      }
-
-      ws.on("message", (rawMessage) => {
-        let event;
-
-        try {
-          event = JSON.parse(rawMessage.toString());
-        } catch {
-          fail(new Error("ElevenLabs realtime API returned invalid JSON."));
-          return;
-        }
-
-        const messageType = event.message_type;
-
-        if (messageType === "session_started") {
-          if (!sessionStarted) {
-            sessionStarted = true;
-            log("batch", "ElevenLabs session started, sending audio chunks...");
-            void sendAudioChunks().catch((error) => {
-              fail(error);
-            });
-          }
-          return;
-        }
-
-        if (messageType === "committed_transcript_with_timestamps") {
-          writeChain = writeChain.then(async () => {
-            const newSegments = createSrtSegmentsFromRealtimeEvent(event);
-            const updatedSegments = insertSegmentsChronologically(segments, newSegments);
-            segments.length = 0;
-            segments.push(...updatedSegments);
-            await fs.writeFile(srtPath, buildSrtContent(segments), "utf8");
-            const preview = newSegments.map((s) => s.text.replace(/\n/g, " ")).join(" | ");
-            log("batch", `+${newSegments.length} cue(s) (${segments.length} total): ${preview}`);
-          });
-          scheduleFinish();
-          return;
-        }
-
-        if (
-          messageType === "auth_error" ||
-          messageType === "quota_exceeded" ||
-          messageType === "transcriber_error" ||
-          messageType === "input_error" ||
-          messageType === "error" ||
-          messageType === "commit_throttled" ||
-          messageType === "unaccepted_terms" ||
-          messageType === "rate_limited" ||
-          messageType === "queue_overflow" ||
-          messageType === "resource_exhausted" ||
-          messageType === "session_time_limit_exceeded" ||
-          messageType === "chunk_size_exceeded" ||
-          messageType === "insufficient_audio_activity"
-        ) {
-          const details =
-            typeof event.message === "string"
-              ? event.message
-              : typeof event.error === "string"
-                ? event.error
-                : JSON.stringify(event);
-          fail(new Error(`ElevenLabs realtime error (${messageType}): ${details}`));
-        }
-      });
-
-      ws.on("error", (error) => {
-        fail(new Error(`ElevenLabs realtime websocket error: ${error.message}`));
-      });
-
-      ws.on("close", () => {
-        if (finalized) {
-          return;
-        }
-
-        if (!sessionStarted) {
-          fail(new Error("ElevenLabs realtime websocket closed before the session started."));
-          return;
-        }
-
-        if (!finalCommitSent) {
-          fail(new Error("ElevenLabs realtime websocket closed before all audio was sent."));
-          return;
-        }
-
-        finish({
-          srtPath,
-          segmentCount: segments.length
-        });
-      });
-    });
-  } finally {
-    await removeFileIfExists(pcmPath);
-  }
-}
-
-async function resolveAudioPath(audioPathInput) {
-  if (typeof audioPathInput !== "string" || !audioPathInput.trim()) {
-    throw new Error("The `audioPath` field is required and must be a non-empty string.");
-  }
-
-  const trimmedPath = audioPathInput.trim();
-  const resolvedPath = path.resolve(__dirname, trimmedPath);
-  const relativePath = path.relative(__dirname, resolvedPath);
-
-  if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-    throw new Error("The `audioPath` must point to a file inside the server folder.");
-  }
-
-  try {
-    const stats = await fs.stat(resolvedPath);
-
-    if (!stats.isFile()) {
-      throw new Error("The `audioPath` must point to a file.");
-    }
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      throw new Error(`Audio file not found: ${resolvedPath}`);
-    }
-
-    throw error;
-  }
-
-  return resolvedPath;
-}
-
-// ---------------------------------------------------------------------------
 // Streaming transcription (realtime WebSocket flow)
 // ---------------------------------------------------------------------------
 
@@ -860,7 +437,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
   if (!apiKey) {
     process.nextTick(() => onError(new Error("ELEVENLABS_API_KEY is not set.")));
-    return { abort() {} };
+    return;
   }
 
   const videoId = extractVideoId(videoUrl);
@@ -869,20 +446,20 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
   log("stream", `starting pipeline for ${videoUrl} (videoId=${videoId || "unknown"})`);
 
-  let aborted = false;
+  let failed = false;
   let ytDlpChild = null;
   let ffmpegChild = null;
   let elWs = null;
   const segments = [];
   let writeChain = Promise.resolve();
 
-  function abort() {
-    if (aborted) {
+  function teardown() {
+    if (failed) {
       return;
     }
 
-    aborted = true;
-    log("stream", "aborting pipeline — killing child processes");
+    failed = true;
+    log("stream", "tearing down pipeline after error");
 
     if (ytDlpChild) {
       ytDlpChild.kill();
@@ -923,27 +500,27 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
       ytDlpChild.on("error", (err) => {
         log("stream", `yt-dlp error: ${err.message}`);
-        if (!aborted) {
+        if (!failed) {
           onError(new Error(`Failed to start yt-dlp: ${err.message}`));
         }
-        abort();
+        teardown();
       });
 
       ffmpegChild.on("error", (err) => {
         log("stream", `ffmpeg error: ${err.message}`);
-        if (!aborted) {
+        if (!failed) {
           onError(new Error(`Failed to start ffmpeg: ${err.message}`));
         }
-        abort();
+        teardown();
       });
 
       ytDlpChild.on("close", (code) => {
         log("stream", `yt-dlp exited with code ${code}`);
-        if (code !== 0 && !aborted) {
+        if (code !== 0 && !failed) {
           onError(new Error(
             `yt-dlp exited with code ${code}.\n${ytDlpStderr || "No output."}`
           ));
-          abort();
+          teardown();
         }
       });
 
@@ -974,7 +551,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       }
 
       function scheduleFinish() {
-        if (!finalCommitSent || aborted) {
+        if (!finalCommitSent || failed) {
           return;
         }
 
@@ -990,13 +567,13 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
         let pcmBuffer = Buffer.alloc(0);
 
         for await (const data of ffmpegChild.stdout) {
-          if (aborted) {
+          if (failed) {
             return;
           }
 
           pcmBuffer = Buffer.concat([pcmBuffer, data]);
 
-          while (pcmBuffer.length >= REALTIME_CHUNK_BYTES && !aborted) {
+          while (pcmBuffer.length >= REALTIME_CHUNK_BYTES && !failed) {
             const chunk = pcmBuffer.subarray(0, REALTIME_CHUNK_BYTES);
             pcmBuffer = pcmBuffer.subarray(REALTIME_CHUNK_BYTES);
 
@@ -1013,7 +590,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
           }
         }
 
-        if (pcmBuffer.length > 0 && !aborted && elWs.readyState === WebSocket.OPEN) {
+        if (pcmBuffer.length > 0 && !failed && elWs.readyState === WebSocket.OPEN) {
           elWs.send(JSON.stringify({
             message_type: "input_audio_chunk",
             audio_base_64: pcmBuffer.toString("base64"),
@@ -1022,7 +599,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
           }));
         }
 
-        if (!aborted && elWs.readyState === WebSocket.OPEN) {
+        if (!failed && elWs.readyState === WebSocket.OPEN) {
           finalCommitSent = true;
           elWs.send(JSON.stringify({
             message_type: "input_audio_chunk",
@@ -1035,7 +612,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       }
 
       elWs.on("message", (rawMessage) => {
-        if (aborted) {
+        if (failed) {
           return;
         }
 
@@ -1045,7 +622,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
           event = JSON.parse(rawMessage.toString());
         } catch {
           onError(new Error("ElevenLabs returned invalid JSON."));
-          abort();
+          teardown();
           return;
         }
 
@@ -1055,10 +632,10 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
           sessionStarted = true;
           log("stream", "ElevenLabs session started — streaming audio chunks...");
           drainFfmpegOutput().catch((err) => {
-            if (!aborted) {
+            if (!failed) {
               onError(err);
             }
-            abort();
+            teardown();
           });
           return;
         }
@@ -1097,20 +674,20 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
                 : JSON.stringify(event);
           log("stream", `ElevenLabs error: ${details}`);
           onError(new Error(`ElevenLabs error (${messageType}): ${details}`));
-          abort();
+          teardown();
         }
       });
 
       elWs.on("error", (err) => {
         log("stream", `ElevenLabs websocket error: ${err.message}`);
-        if (!aborted) {
+        if (!failed) {
           onError(new Error(`ElevenLabs websocket error: ${err.message}`));
         }
-        abort();
+        teardown();
       });
 
       elWs.on("close", () => {
-        if (aborted) {
+        if (failed) {
           return;
         }
 
@@ -1130,14 +707,12 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       });
     } catch (err) {
       log("stream", `pipeline error: ${err.message}`);
-      if (!aborted) {
+      if (!failed) {
         onError(err);
       }
-      abort();
+      teardown();
     }
   })();
-
-  return { abort };
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,63 +730,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method !== "POST") {
-    sendJson(res, 404, {
-      error: "Not found. Use POST /download or POST /transcribe."
-    });
-    return;
-  }
-
-  log("http", `${req.method} ${req.url}`);
-
-  try {
-    const body = await parseJsonBody(req);
-    if (req.url === "/download") {
-      const videoUrl = body.url;
-
-      if (typeof videoUrl !== "string" || !isValidHttpUrl(videoUrl)) {
-        sendJson(res, 400, {
-          error: "The `url` field is required and must be a valid http(s) URL."
-        });
-        return;
-      }
-
-      log("download", `starting for ${videoUrl}`);
-      const requestId = createRequestId();
-      const { audioPath } = await runYtDlp(videoUrl, requestId);
-      log("download", `complete → ${path.basename(audioPath)}`);
-
-      sendJson(res, 200, {
-        ok: true,
-        requestId,
-        audioFile: path.basename(audioPath),
-        audioPath
-      });
-      return;
-    }
-
-    if (req.url === "/transcribe") {
-      const audioPath = await resolveAudioPath(body.audioPath);
-      log("transcribe", `starting for ${path.basename(audioPath)}`);
-      const { srtPath, segmentCount } = await transcribeAudioRealtime(audioPath);
-      log("transcribe", `complete → ${path.basename(srtPath)} (${segmentCount} segments)`);
-
-      sendJson(res, 200, {
-        ok: true,
-        audioFile: path.basename(audioPath),
-        srtFile: path.basename(srtPath),
-        segmentCount
-      });
-      return;
-    }
-
-    sendJson(res, 404, {
-      error: "Not found. Use POST /download or POST /transcribe."
-    });
-  } catch (error) {
-    log("http", `error: ${error.message}`);
-    sendJson(res, 500, { ok: false, error: error.message });
-  }
+  sendJson(res, 404, { error: "Not found." });
 });
 
 // ---------------------------------------------------------------------------
@@ -1260,7 +779,7 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
 
   let finished = false;
 
-  const session = streamTranscribeFromUrl(videoUrl, {
+  streamTranscribeFromUrl(videoUrl, {
     onCues(newCues) {
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({ type: "cues", cues: newCues }));
@@ -1307,9 +826,8 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
 
   clientWs.on("close", () => {
     if (!finished) {
-      log("ws", "client disconnected — aborting pipeline");
+      log("ws", "client disconnected — pipeline will continue to completion");
     }
-    session.abort();
   });
 }
 

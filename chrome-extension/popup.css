@@ -89,14 +89,6 @@ button.primary:hover {
   background: #1d4ed8;
 }
 
-button.primary.generating {
-  background: #dc2626;
-}
-
-button.primary.generating:hover {
-  background: #b91c1c;
-}
-
 .file-picker {
   background: rgba(255, 255, 255, 0.1);
   color: #f9fafb;
