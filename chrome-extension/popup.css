@@ -46,6 +46,34 @@ h1 {
   word-break: break-word;
 }
 
+.meta.hidden {
+  display: none;
+}
+
+/* Loaded / Unloaded badge */
+
+.badge {
+  display: inline-block;
+  padding: 5px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin-bottom: 12px;
+}
+
+.badge.loaded {
+  background: #166534;
+  color: #bbf7d0;
+}
+
+.badge.unloaded {
+  background: rgba(255, 255, 255, 0.08);
+  color: #94a3b8;
+}
+
+/* Inputs */
+
 .text-input {
   display: block;
   width: 100%;
@@ -64,6 +92,8 @@ h1 {
 .text-input:focus {
   border-color: #2563eb;
 }
+
+/* Buttons */
 
 .file-picker,
 button {
@@ -85,7 +115,7 @@ button.primary {
   color: #fff;
 }
 
-button.primary:hover {
+button.primary:hover:not(:disabled) {
   background: #1d4ed8;
 }
 
@@ -95,7 +125,7 @@ button.primary:hover {
   border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
-.file-picker:hover {
+.file-picker:hover:not(.disabled) {
   background: rgba(255, 255, 255, 0.16);
 }
 
@@ -110,13 +140,13 @@ input[type="file"] {
 
 button.secondary {
   width: 100%;
-  background: rgba(255, 255, 255, 0.08);
-  color: #f9fafb;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(220, 38, 38, 0.15);
+  color: #fca5a5;
+  border: 1px solid rgba(220, 38, 38, 0.25);
 }
 
-button.secondary:hover {
-  background: rgba(255, 255, 255, 0.14);
+button.secondary:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.25);
 }
 
 button:disabled,
@@ -125,18 +155,3 @@ button:disabled,
   opacity: 0.55;
 }
 
-.status {
-  min-height: 18px;
-  margin: 12px 0 0;
-  font-size: 12px;
-  color: #93c5fd;
-  line-height: 1.4;
-}
-
-.status.error {
-  color: #fca5a5;
-}
-
-.status.success {
-  color: #86efac;
-}

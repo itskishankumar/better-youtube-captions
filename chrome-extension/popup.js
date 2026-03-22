@@ -4,18 +4,21 @@ const DEFAULT_SERVER_URL = "ws://localhost:8080";
 
 const videoStatusEl = document.getElementById("videoStatus");
 const videoMetaEl = document.getElementById("videoMeta");
+const captionBadgeEl = document.getElementById("captionBadge");
 const serverUrlEl = document.getElementById("serverUrl");
 const generateButtonEl = document.getElementById("generateButton");
 const streamStatusEl = document.getElementById("streamStatus");
 const fileInputEl = document.getElementById("srtFile");
 const fileMetaEl = document.getElementById("fileMeta");
 const clearButtonEl = document.getElementById("clearButton");
-const statusMessageEl = document.getElementById("statusMessage");
 const filePickerLabelEl = document.querySelector(".file-picker");
 
 let currentTab = null;
 let currentVideoId = null;
 let statusPollTimer = null;
+let captionsLoaded = false;
+let generationActive = false;
+let manualFileName = null;
 
 function getStorageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -35,28 +38,72 @@ function parseVideoIdFromUrl(urlString) {
   }
 }
 
-function setStatus(message, type = "") {
-  statusMessageEl.textContent = message;
-  statusMessageEl.classList.remove("error", "success");
-
-  if (type) {
-    statusMessageEl.classList.add(type);
-  }
-}
+// ---------------------------------------------------------------------------
+// UI helpers
+// ---------------------------------------------------------------------------
 
 function setStreamStatus(message) {
   streamStatusEl.textContent = message;
 }
 
-function setControlsEnabled(enabled) {
-  fileInputEl.disabled = !enabled;
-  clearButtonEl.disabled = !enabled;
-  filePickerLabelEl.classList.toggle("disabled", !enabled);
+function setBadge(loaded) {
+  captionsLoaded = loaded;
+
+  if (loaded) {
+    captionBadgeEl.textContent = "Loaded";
+    captionBadgeEl.classList.remove("unloaded");
+    captionBadgeEl.classList.add("loaded");
+  } else {
+    captionBadgeEl.textContent = "Unloaded";
+    captionBadgeEl.classList.remove("loaded");
+    captionBadgeEl.classList.add("unloaded");
+  }
+
+  syncControls();
 }
 
-function updateGenerateButton(generating) {
-  generateButtonEl.disabled = generating;
+function syncControls() {
+  const hasVideo = Boolean(currentVideoId);
+  const blockGenerate = !hasVideo || captionsLoaded || generationActive;
+
+  serverUrlEl.disabled = !hasVideo;
+  generateButtonEl.disabled = blockGenerate;
+  clearButtonEl.disabled = !hasVideo;
+  fileInputEl.disabled = !hasVideo;
+  filePickerLabelEl.classList.toggle("disabled", !hasVideo);
 }
+
+function applySource(source) {
+  if (source === "file") {
+    streamStatusEl.classList.add("hidden");
+    if (manualFileName) {
+      fileMetaEl.textContent = manualFileName;
+      fileMetaEl.classList.remove("hidden");
+    }
+  } else if (source === "server") {
+    fileMetaEl.classList.add("hidden");
+    streamStatusEl.classList.remove("hidden");
+  } else {
+    fileMetaEl.classList.add("hidden");
+    streamStatusEl.classList.remove("hidden");
+  }
+}
+
+function showFileMeta(name) {
+  manualFileName = name;
+  fileMetaEl.textContent = name;
+  fileMetaEl.classList.remove("hidden");
+}
+
+function hideFileMeta() {
+  manualFileName = null;
+  fileMetaEl.classList.add("hidden");
+  fileMetaEl.textContent = "";
+}
+
+// ---------------------------------------------------------------------------
+// Tab helpers
+// ---------------------------------------------------------------------------
 
 async function getActiveTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -98,6 +145,10 @@ async function ensureContentScriptReady() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
 async function hasStoredCaptions(videoId) {
   const stored = await chrome.storage.local.get(getStorageKey(videoId));
   const value = stored[getStorageKey(videoId)];
@@ -119,7 +170,7 @@ function getWsUrl() {
 }
 
 // ---------------------------------------------------------------------------
-// Status polling — ask the content script for generation state
+// Status polling
 // ---------------------------------------------------------------------------
 
 function applyStatus(state) {
@@ -127,24 +178,27 @@ function applyStatus(state) {
     return;
   }
 
-  updateGenerateButton(state.active);
+  generationActive = state.active;
+  const hasCues = state.cueCount > 0;
+
+  setBadge(hasCues);
 
   if (state.active && state.status === "connecting") {
     setStreamStatus("Connecting...");
-    setStatus("");
   } else if (state.active && state.status === "receiving") {
     setStreamStatus(`Receiving captions... (${state.cueCount} cues)`);
-    setStatus("");
-  } else if (state.status === "done") {
-    setStreamStatus(`Generation complete — ${state.cueCount} cues.`);
-    setStatus("Generation complete", "success");
-  } else if (state.status === "done_cached") {
-    setStreamStatus(`Loaded from cache — ${state.cueCount} cues.`);
-    setStatus("Loaded from cache", "success");
+  } else if (state.status === "done" || state.status === "done_cached") {
+    setStreamStatus(`Loaded ${state.cueCount} cues.`);
   } else if (state.status === "error") {
-    setStreamStatus("");
-    setStatus(state.error || "Server error.", "error");
+    setStreamStatus(state.error || "Server error.");
   }
+
+  if (state.captionSource === "file" && state.captionFileName) {
+    manualFileName = state.captionFileName;
+  }
+
+  applySource(state.captionSource);
+  syncControls();
 }
 
 async function pollStatus() {
@@ -172,11 +226,11 @@ function startPolling() {
 }
 
 // ---------------------------------------------------------------------------
-// Generate / Stop
+// Generate
 // ---------------------------------------------------------------------------
 
 async function startGeneration() {
-  if (!currentVideoId) {
+  if (!currentVideoId || captionsLoaded || generationActive) {
     return;
   }
 
@@ -196,14 +250,14 @@ async function startGeneration() {
     serverUrl
   });
 
+  generationActive = true;
   setStreamStatus("Connecting...");
-  setStatus("");
-  updateGenerateButton(true);
+  syncControls();
   startPolling();
 }
 
 // ---------------------------------------------------------------------------
-// File picker (fallback)
+// File picker
 // ---------------------------------------------------------------------------
 
 async function handleFileSelection(event) {
@@ -228,13 +282,15 @@ async function handleFileSelection(event) {
     await sendMessageToActiveTab({
       type: "CAPTION_REPLACER_APPLY_SRT",
       videoId: currentVideoId,
-      srtText
+      srtText,
+      fileName: file.name
     });
 
-    fileMetaEl.textContent = "Captions stored for this video.";
-    setStatus(`Applied ${file.name} to the current video.`, "success");
+    showFileMeta(file.name);
+    setBadge(true);
+    applySource("file");
   } catch (error) {
-    setStatus(error.message || "Failed to read the selected SRT file.", "error");
+    setStreamStatus(error.message || "Failed to read the selected SRT file.");
   } finally {
     fileInputEl.value = "";
   }
@@ -256,9 +312,10 @@ async function handleClear() {
     videoId: currentVideoId
   });
 
-  fileMetaEl.textContent = "No captions for this video.";
+  setBadge(false);
+  hideFileMeta();
   setStreamStatus("");
-  setStatus("Cleared custom captions for this video.");
+  applySource("");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,24 +332,18 @@ async function refreshPopupState() {
   if (!currentVideoId) {
     videoStatusEl.textContent = "Open a YouTube watch page first.";
     videoMetaEl.textContent = "";
-    fileMetaEl.textContent = "";
-    generateButtonEl.disabled = true;
-    setControlsEnabled(false);
-    setStatus("");
+    setBadge(false);
+    syncControls();
     return;
   }
 
   videoStatusEl.textContent = "Ready to replace captions.";
   videoMetaEl.textContent = `Video ID: ${currentVideoId}`;
-  generateButtonEl.disabled = false;
-  setControlsEnabled(true);
+
   await ensureContentScriptReady();
 
-  if (await hasStoredCaptions(currentVideoId)) {
-    fileMetaEl.textContent = "Captions stored for this video.";
-  } else {
-    fileMetaEl.textContent = "No captions for this video.";
-  }
+  const hasCaptions = await hasStoredCaptions(currentVideoId);
+  setBadge(hasCaptions);
 
   const status = await sendMessageToActiveTab({
     type: "CAPTION_REPLACER_GET_STATUS"

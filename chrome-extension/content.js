@@ -15,6 +15,8 @@ let rafId = null;
 // ---------------------------------------------------------------------------
 
 let generationWs = null;
+let captionSource = "";
+let captionFileName = "";
 let generationState = {
   active: false,
   status: "",
@@ -360,6 +362,8 @@ function clearCustomCaptions() {
   disableSettingsSubtitleHiding();
   stopRendering();
 
+  captionSource = "";
+  captionFileName = "";
   generationState = { active: false, status: "", cueCount: 0, error: "" };
 
   if (textEl) {
@@ -468,6 +472,7 @@ function startGeneration(serverUrl) {
 
   ws.addEventListener("open", () => {
     generationState.status = "receiving";
+    captionSource = "server";
   });
 
   ws.addEventListener("message", (event) => {
@@ -495,6 +500,7 @@ function startGeneration(serverUrl) {
     if (data.type === "done") {
       generationState.active = false;
       generationState.status = data.cached ? "done_cached" : "done";
+      captionSource = "server";
       generationWs = null;
       saveGeneratedSrt();
     }
@@ -547,12 +553,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     if (message?.type === "CAPTION_REPLACER_GET_STATUS") {
-      sendResponse({ ok: true, ...generationState });
+      sendResponse({ ok: true, ...generationState, cueCount: cues.length, captionSource, captionFileName });
       return true;
     }
 
     if (message?.type === "CAPTION_REPLACER_APPLY_SRT") {
       applySrtText(message.srtText || "", message.videoId);
+      captionSource = "file";
+      captionFileName = message.fileName || "";
       sendResponse({ ok: true, cueCount: cues.length });
       return true;
     }
