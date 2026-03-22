@@ -1,0 +1,13 @@
+{
+  "name": "csulb-beachhacks-2026",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Node HTTP server for invoking yt-dlp_macos with a video URL.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --env-file=.env server.js"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}

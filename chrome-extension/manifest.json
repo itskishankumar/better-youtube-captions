@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Caption Replacer",
+  "version": "0.1.0",
+  "description": "Replace YouTube captions with a local SRT file for the current video.",
+  "permissions": [
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*"
+  ],
+  "action": {
+    "default_title": "YouTube Caption Replacer",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
