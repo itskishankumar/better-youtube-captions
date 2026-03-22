@@ -4,14 +4,16 @@ Node.js server that streams realtime captions for YouTube videos to the companio
 
 1. downloads audio from a YouTube URL with `yt-dlp_macos`
 2. pipes the audio through `ffmpeg` into ElevenLabs realtime speech-to-text
-3. pushes subtitle cues to the Chrome extension over WebSocket as they arrive
-4. writes the final `.srt` file to disk and caches it so repeat requests are served instantly
+3. (optional) performs a contextual and grammatical sanity pass on the text chunks using Google Gemini
+4. pushes subtitle cues to the Chrome extension over WebSocket as they arrive
+5. writes the final `.srt` file to disk and caches it so repeat requests are served instantly
 
 ## Requirements
 
 - Node.js 20+
 - `ffmpeg` installed and available on `PATH`
 - an ElevenLabs API key
+- an optional Google Gemini API key (for the text sanity pass)
 - the `yt-dlp_macos` binary in this folder
 
 ## Environment
@@ -20,10 +22,12 @@ Create a `.env` file in this folder with:
 
 ```env
 ELEVENLABS_API_KEY=your_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+ENABLE_GEMINI_SANITY_PASS=true
 PORT=8080
 ```
 
-`PORT` is optional. The server defaults to `8080`.
+`PORT`, `GEMINI_API_KEY`, and `ENABLE_GEMINI_SANITY_PASS` are optional. The server defaults to `8080`.
 
 ## Install
 
@@ -64,9 +68,8 @@ If the client disconnects mid-stream, the transcription pipeline continues to co
 3. the server opens an ElevenLabs realtime WebSocket session (`scribe_v2_realtime`)
 4. PCM chunks are base64-encoded and sent to ElevenLabs in real time
 5. `committed_transcript_with_timestamps` events are converted into subtitle cues
-6. the `.srt` file is rewritten after each committed update
-
-All three stages run concurrently (`yt-dlp → ffmpeg → ElevenLabs`) so captions start arriving within seconds rather than waiting for a full download. No temporary files are written — audio is piped directly.
+6. (Optional) If `ENABLE_GEMINI_SANITY_PASS` is enabled and a key is provided, the subtitle cue batch is dispatched to `gemini-3-flash-preview` to dynamically correct STT grammar and spelling errors using a rolling 3-sentence history.
+7. the `.srt` file is rewritten after each committed update
 
 Each `.srt` write produces a complete, valid SRT file — not an append-only fragment.
 

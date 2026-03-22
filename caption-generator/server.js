@@ -6,9 +6,10 @@ const path = require("path");
 const WebSocket = require("ws");
 const { GoogleGenAI } = require("@google/genai");
 
-let ai = null;
-if (process.env.GEMINI_API_KEY) {
-  ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ENABLE_GEMINI_ENV = process.env.ENABLE_GEMINI_SANITY_PASS !== "false";
+let gemini = null;
+if (ENABLE_GEMINI_ENV && process.env.GEMINI_API_KEY) {
+  gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 }
 
 const PORT = process.env.PORT || 8080;
@@ -453,7 +454,7 @@ function insertSegmentsChronologically(existingSegments, newSegments) {
 // ---------------------------------------------------------------------------
 
 async function sanitizeCuesWithGemini(contextSegments, newCues) {
-  if (!ai || newCues.length === 0) return newCues;
+  if (!gemini || newCues.length === 0) return newCues;
 
   try {
     const contextText = contextSegments
@@ -473,7 +474,7 @@ async function sanitizeCuesWithGemini(contextSegments, newCues) {
     \n[CONTEXT]: "${contextText}"
     \n[CURRENT]: ${JSON.stringify(currentArray)}`;
 
-    const response = await ai.models.generateContent({
+    const response = await gemini.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
@@ -776,25 +777,26 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
                 .map((c) => c.text.replace(/\n/g, " "))
                 .join(" | ");
               log(
-                "ElevenLabs",
+                "elevenLabs",
                 `Received | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
               );
 
-              newCues = await sanitizeCuesWithGemini(segments, newCues);
+              if (gemini) {
+                newCues = await sanitizeCuesWithGemini(segments, newCues);
+                preview = newCues
+                  .map((c) => c.text.replace(/\n/g, " "))
+                  .join(" | ");
+                log(
+                  "gemini",
+                  `Sanitized | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
+                );
+              }
 
               const updated = insertSegmentsChronologically(segments, newCues);
               segments.length = 0;
               segments.push(...updated);
 
               await fs.writeFile(srtPath, buildSrtContent(segments), "utf8");
-
-              preview = newCues
-                .map((c) => c.text.replace(/\n/g, " "))
-                .join(" | ");
-              log(
-                "gemini",
-                `Sanitized | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
-              );
 
               onCues(newCues);
             } catch (err) {
