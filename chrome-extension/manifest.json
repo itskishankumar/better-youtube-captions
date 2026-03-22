@@ -9,7 +9,8 @@
     "tabs"
   ],
   "host_permissions": [
-    "https://www.youtube.com/*"
+    "https://www.youtube.com/*",
+    "http://localhost:*"
   ],
   "action": {
     "default_title": "YouTube Caption Replacer",

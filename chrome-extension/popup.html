@@ -9,7 +9,6 @@
   <body>
     <main class="app">
       <h1>YouTube Caption Replacer</h1>
-      <p class="subtitle">Pick a finished <code>.srt</code> file for the current YouTube video.</p>
 
       <section class="panel">
         <div class="label">Current video</div>
@@ -18,6 +17,14 @@
       </section>
 
       <section class="panel">
+        <div class="label">Server</div>
+        <input id="serverUrl" type="text" class="text-input" placeholder="ws://localhost:8080">
+        <button id="generateButton" type="button" class="primary">Generate Captions</button>
+        <div id="streamStatus" class="meta"></div>
+      </section>
+
+      <section class="panel">
+        <div class="label">Or load an existing file</div>
         <label class="file-picker" for="srtFile">Choose SRT File</label>
         <input id="srtFile" type="file" accept=".srt,text/plain">
         <div id="fileMeta" class="meta">No SRT selected for this video.</div>

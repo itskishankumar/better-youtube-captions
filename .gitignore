@@ -3,8 +3,8 @@
 caption-generator/.env
 caption-generator/node_modules/
 caption-generator/*.webm
-caption-generator/*.srt
 caption-generator/*.pcm
+caption-generator/captions/
 caption-generator/yt-dlp_macos
 
 .idea

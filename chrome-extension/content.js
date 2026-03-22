@@ -1,5 +1,6 @@
 const STORAGE_PREFIX = "caption-replacer:";
 const HIDE_STYLE_ID = "yt-srt-hide-native-captions-style";
+const DEFAULT_SERVER_URL = "ws://localhost:8080";
 
 let currentVideoId = null;
 let cues = [];
@@ -7,6 +8,22 @@ let overlayEl = null;
 let textEl = null;
 let videoEl = null;
 let rafId = null;
+
+// ---------------------------------------------------------------------------
+// Generation state (WebSocket lives here, survives popup close)
+// ---------------------------------------------------------------------------
+
+let generationWs = null;
+let generationState = {
+  active: false,
+  status: "",
+  cueCount: 0,
+  error: ""
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function getStorageKey(videoId) {
   return `${STORAGE_PREFIX}${videoId}`;
@@ -96,6 +113,10 @@ function parseSrt(srtText) {
 
   return parsed.sort((a, b) => a.start - b.start);
 }
+
+// ---------------------------------------------------------------------------
+// Caption overlay
+// ---------------------------------------------------------------------------
 
 function ensureOverlay() {
   const container = document.querySelector(".html5-video-player");
@@ -203,6 +224,20 @@ function showNativeCaptions() {
   document.getElementById(HIDE_STYLE_ID)?.remove();
 }
 
+function insertCuesChronologically(existing, incoming) {
+  const combined = [...existing, ...incoming];
+
+  combined.sort((a, b) => {
+    if (a.start !== b.start) {
+      return a.start - b.start;
+    }
+
+    return a.end - b.end;
+  });
+
+  return combined;
+}
+
 function findCurrentCue(timeSec) {
   for (let i = 0; i < cues.length; i += 1) {
     const cue = cues[i];
@@ -214,6 +249,10 @@ function findCurrentCue(timeSec) {
 
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
 
 function renderLoop() {
   if (!videoEl || !textEl || !cues.length) {
@@ -329,10 +368,170 @@ async function loadStoredCaptionsForCurrentVideo() {
   applySrtText(entry.srtText, videoId);
 }
 
+// ---------------------------------------------------------------------------
+// Realtime generation (WebSocket managed here, not in popup)
+// ---------------------------------------------------------------------------
+
+function formatTimestamp(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const ms = Math.round((sec - Math.floor(sec)) * 1000);
+
+  return (
+    String(h).padStart(2, "0") + ":" +
+    String(m).padStart(2, "0") + ":" +
+    String(s).padStart(2, "0") + "," +
+    String(ms).padStart(3, "0")
+  );
+}
+
+async function saveGeneratedSrt() {
+  const videoId = getCurrentVideoId();
+
+  if (!videoId || cues.length === 0) {
+    return;
+  }
+
+  const srtText = cues
+    .map((cue, i) => `${i + 1}\n${formatTimestamp(cue.start)} --> ${formatTimestamp(cue.end)}\n${cue.text}`)
+    .join("\n\n") + "\n";
+
+  await chrome.storage.local.set({
+    [getStorageKey(videoId)]: {
+      fileName: "generated-captions.srt",
+      srtText,
+      updatedAt: Date.now()
+    }
+  });
+}
+
+function startGeneration(serverUrl) {
+  if (generationWs) {
+    stopGeneration();
+  }
+
+  const videoId = getCurrentVideoId();
+
+  if (!videoId) {
+    return;
+  }
+
+  clearCustomCaptions();
+  currentVideoId = videoId;
+
+  try {
+    startRendering();
+  } catch {
+    // Video element may not be ready yet.
+  }
+
+  generationState = { active: true, status: "connecting", cueCount: 0, error: "" };
+
+  const wsBase = (serverUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "");
+  const wsUrl = `${wsBase}/captions?url=${encodeURIComponent(window.location.href)}`;
+
+  const ws = new WebSocket(wsUrl);
+  generationWs = ws;
+
+  ws.addEventListener("open", () => {
+    generationState.status = "receiving";
+  });
+
+  ws.addEventListener("message", (event) => {
+    let data;
+
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (data.type === "cues" && Array.isArray(data.cues)) {
+      cues = insertCuesChronologically(cues, data.cues);
+      generationState.cueCount = cues.length;
+
+      if (!videoEl || !rafId) {
+        try {
+          startRendering();
+        } catch {
+          // Ignore if video element is not available yet.
+        }
+      }
+    }
+
+    if (data.type === "done") {
+      generationState.active = false;
+      generationState.status = data.cached ? "done_cached" : "done";
+      generationWs = null;
+      saveGeneratedSrt();
+    }
+
+    if (data.type === "error") {
+      generationState.active = false;
+      generationState.status = "error";
+      generationState.error = data.message || "Server error.";
+      generationWs = null;
+    }
+  });
+
+  ws.addEventListener("error", () => {
+    if (generationWs !== ws) {
+      return;
+    }
+
+    generationState.active = false;
+    generationState.status = "error";
+    generationState.error = "Could not connect to the caption server.";
+    generationWs = null;
+  });
+
+  ws.addEventListener("close", () => {
+    if (generationWs === ws) {
+      generationWs = null;
+
+      if (generationState.active) {
+        generationState.active = false;
+      }
+    }
+  });
+}
+
+function stopGeneration() {
+  if (generationWs) {
+    generationWs.close();
+    generationWs = null;
+  }
+
+  generationState.active = false;
+  generationState.status = generationState.cueCount > 0 ? "stopped" : "";
+}
+
+// ---------------------------------------------------------------------------
+// Message handler
+// ---------------------------------------------------------------------------
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   try {
     if (message?.type === "CAPTION_REPLACER_PING") {
       sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === "CAPTION_REPLACER_START_GENERATION") {
+      startGeneration(message.serverUrl);
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === "CAPTION_REPLACER_STOP_GENERATION") {
+      stopGeneration();
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === "CAPTION_REPLACER_GET_STATUS") {
+      sendResponse({ ok: true, ...generationState });
       return true;
     }
 
@@ -344,6 +543,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     if (message?.type === "CAPTION_REPLACER_CLEAR_SRT") {
       if (message.videoId === getCurrentVideoId()) {
+        stopGeneration();
         clearCustomCaptions();
       }
 
@@ -358,6 +558,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Storage change listener and DOM observer
+// ---------------------------------------------------------------------------
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") {
