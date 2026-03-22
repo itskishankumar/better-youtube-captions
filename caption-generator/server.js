@@ -4,10 +4,17 @@ const http = require("http");
 const { spawn } = require("child_process");
 const path = require("path");
 const WebSocket = require("ws");
+const { GoogleGenAI } = require("@google/genai");
+
+let ai = null;
+if (process.env.GEMINI_API_KEY) {
+  ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+}
 
 const PORT = process.env.PORT || 8080;
 const BINARY_PATH = path.join(__dirname, "yt-dlp_macos");
-const ELEVENLABS_REALTIME_ENDPOINT = "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
+const ELEVENLABS_REALTIME_ENDPOINT =
+  "wss://api.elevenlabs.io/v1/speech-to-text/realtime";
 const ELEVENLABS_REALTIME_MODEL_ID = "scribe_v2_realtime";
 const REALTIME_SAMPLE_RATE = 16000;
 const REALTIME_CHUNK_BYTES = 16000;
@@ -38,7 +45,7 @@ function sendJson(res, statusCode, payload) {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Headers": "Content-Type",
   });
   res.end(JSON.stringify(payload));
 }
@@ -124,7 +131,7 @@ async function addCacheEntry(videoUrl, videoId, srtFile, segmentCount) {
     videoId,
     srtFile,
     segmentCount,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
   };
   await saveCache(cache);
 }
@@ -138,7 +145,9 @@ function formatSrtTimestamp(totalSeconds) {
   const hours = Math.floor(safeSeconds / 3600);
   const minutes = Math.floor((safeSeconds % 3600) / 60);
   const seconds = Math.floor(safeSeconds % 60);
-  const milliseconds = Math.round((safeSeconds - Math.floor(safeSeconds)) * 1000);
+  const milliseconds = Math.round(
+    (safeSeconds - Math.floor(safeSeconds)) * 1000,
+  );
 
   const normalizedSeconds = seconds + Math.floor(milliseconds / 1000);
   const normalizedMilliseconds = milliseconds % 1000;
@@ -147,13 +156,11 @@ function formatSrtTimestamp(totalSeconds) {
   const normalizedHours = hours + Math.floor(normalizedMinutes / 60);
   const displayMinutes = normalizedMinutes % 60;
 
-  return `${String(normalizedHours).padStart(2, "0")}:${String(displayMinutes).padStart(
-    2,
-    "0"
-  )}:${String(displaySeconds).padStart(2, "0")},${String(normalizedMilliseconds).padStart(
-    3,
-    "0"
-  )}`;
+  return `${String(normalizedHours).padStart(2, "0")}:${String(
+    displayMinutes,
+  ).padStart(2, "0")}:${String(displaySeconds).padStart(2, "0")},${String(
+    normalizedMilliseconds,
+  ).padStart(3, "0")}`;
 }
 
 function buildSrtContent(segments) {
@@ -166,14 +173,17 @@ function buildSrtContent(segments) {
       return [
         String(index + 1),
         `${formatSrtTimestamp(segment.start)} --> ${formatSrtTimestamp(segment.end)}`,
-        segment.text
+        segment.text,
       ].join("\n");
     })
     .join("\n\n")}\n`;
 }
 
 function parseSrt(srtText) {
-  const blocks = srtText.replace(/\r\n/g, "\n").trim().split(/\n{2,}/);
+  const blocks = srtText
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .split(/\n{2,}/);
   const parsed = [];
 
   for (const block of blocks) {
@@ -194,7 +204,7 @@ function parseSrt(srtText) {
     }
 
     const timeMatch = lines[idx].match(
-      /^(\d{2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{1,3})$/
+      /^(\d{2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{1,3})$/,
     );
 
     if (!timeMatch) {
@@ -227,7 +237,10 @@ function parseSrt(srtText) {
       continue;
     }
 
-    const text = lines.slice(idx + 1).join("\n").trim();
+    const text = lines
+      .slice(idx + 1)
+      .join("\n")
+      .trim();
 
     if (!text) {
       continue;
@@ -267,7 +280,10 @@ function wrapSubtitleText(text) {
     const leftLength = text.slice(0, i).trim().length;
     const rightLength = text.slice(i + 1).trim().length;
 
-    if (leftLength > SRT_MAX_CHARS_PER_LINE || rightLength > SRT_MAX_CHARS_PER_LINE) {
+    if (
+      leftLength > SRT_MAX_CHARS_PER_LINE ||
+      rightLength > SRT_MAX_CHARS_PER_LINE
+    ) {
       continue;
     }
 
@@ -302,7 +318,7 @@ function finalizeCueFromTokens(tokens) {
   return {
     start: timedTokens[0].start,
     end: timedTokens[timedTokens.length - 1].end,
-    text: wrapSubtitleText(text)
+    text: wrapSubtitleText(text),
   };
 }
 
@@ -317,9 +333,14 @@ function shouldSplitCue(tokens, nextToken) {
   const plainText = cue.text.replace(/\n/g, " ");
   const lastText = tokens[tokens.length - 1]?.text || "";
   const pauseToNext =
-    nextToken && typeof nextToken.start === "number" ? Math.max(0, nextToken.start - cue.end) : 0;
+    nextToken && typeof nextToken.start === "number"
+      ? Math.max(0, nextToken.start - cue.end)
+      : 0;
 
-  if (duration >= SRT_MAX_CUE_DURATION_S || plainText.length >= SRT_MAX_CUE_CHARS) {
+  if (
+    duration >= SRT_MAX_CUE_DURATION_S ||
+    plainText.length >= SRT_MAX_CUE_CHARS
+  ) {
     return true;
   }
 
@@ -331,7 +352,10 @@ function shouldSplitCue(tokens, nextToken) {
     return true;
   }
 
-  if (/[,;:]["')\]]*$/.test(lastText) && (duration >= 2.0 || plainText.length >= 32)) {
+  if (
+    /[,;:]["')\]]*$/.test(lastText) &&
+    (duration >= 2.0 || plainText.length >= 32)
+  ) {
     return true;
   }
 
@@ -340,21 +364,31 @@ function shouldSplitCue(tokens, nextToken) {
 
 function createSrtSegmentsFromRealtimeEvent(event) {
   if (!Array.isArray(event.words) || event.words.length === 0) {
-    throw new Error("Realtime transcript commit did not include any timestamped words.");
+    throw new Error(
+      "Realtime transcript commit did not include any timestamped words.",
+    );
   }
 
   const timedWords = event.words.filter((word) => {
-    return typeof word.text === "string" && typeof word.start === "number" && typeof word.end === "number";
+    return (
+      typeof word.text === "string" &&
+      typeof word.start === "number" &&
+      typeof word.end === "number"
+    );
   });
 
   if (timedWords.length === 0) {
-    throw new Error("Realtime transcript commit did not include valid word timestamps.");
+    throw new Error(
+      "Realtime transcript commit did not include valid word timestamps.",
+    );
   }
 
   const text = typeof event.text === "string" ? event.text.trim() : "";
 
   if (!text) {
-    throw new Error("Realtime transcript commit did not include transcript text.");
+    throw new Error(
+      "Realtime transcript commit did not include transcript text.",
+    );
   }
 
   const segments = [];
@@ -386,7 +420,9 @@ function createSrtSegmentsFromRealtimeEvent(event) {
   }
 
   if (segments.length === 0) {
-    throw new Error("Realtime transcript commit could not be converted into SRT segments.");
+    throw new Error(
+      "Realtime transcript commit could not be converted into SRT segments.",
+    );
   }
 
   return segments;
@@ -407,9 +443,66 @@ function insertSegmentsChronologically(existingSegments, newSegments) {
     return {
       start: segment.start,
       end: segment.end,
-      text: segment.text
+      text: segment.text,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Gemini Sanity Pass
+// ---------------------------------------------------------------------------
+
+async function sanitizeCuesWithGemini(contextSegments, newCues) {
+  if (!ai || newCues.length === 0) return newCues;
+
+  try {
+    const contextText = contextSegments
+      .slice(-3)
+      .map((c) => c.text)
+      .join(" ");
+    const currentArray = newCues.map((c) => c.text);
+
+    const prompt = `You are a real-time speech transcription cleaner. 
+    \nUsing the [CONTEXT] for grammatical alignment, fix any obvious speech-to-text errors in the [CURRENT] JSON array of phrases.
+    \nCRITICAL RULES:\n1. Output ONLY a valid JSON array of strings.
+    \n2. The output array MUST have exactly ${currentArray.length} elements, corresponding 1:1 to the [CURRENT] array.
+    \n3. Keep the original meaning and tone exactly the same.
+    \n4. If you don't spot any punctuation and or capitalization, then add your own. Else, leave it as is.
+    \n5. Do not include the [CONTEXT] in your output.
+    \n
+    \n[CONTEXT]: "${contextText}"
+    \n[CURRENT]: ${JSON.stringify(currentArray)}`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+      },
+    });
+
+    const responseData = JSON.parse(response.text.trim());
+
+    if (
+      !Array.isArray(responseData) ||
+      responseData.length !== newCues.length
+    ) {
+      log(
+        "gemini",
+        "Sanity pass warning: Output array length mismatch, skipping.",
+      );
+      return newCues;
+    }
+
+    return newCues.map((cue, i) => ({
+      start: cue.start,
+      end: cue.end,
+      text: responseData[i] || cue.text,
+    }));
+  } catch (err) {
+    log("gemini", `Sanity pass failed for cue batch: ${err.message}`);
+    return newCues;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,14 +522,16 @@ const ELEVENLABS_ERROR_TYPES = new Set([
   "resource_exhausted",
   "session_time_limit_exceeded",
   "chunk_size_exceeded",
-  "insufficient_audio_activity"
+  "insufficient_audio_activity",
 ]);
 
 function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
   const apiKey = process.env.ELEVENLABS_API_KEY;
 
   if (!apiKey) {
-    process.nextTick(() => onError(new Error("ELEVENLABS_API_KEY is not set.")));
+    process.nextTick(() =>
+      onError(new Error("ELEVENLABS_API_KEY is not set.")),
+    );
     return;
   }
 
@@ -444,7 +539,10 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
   const srtBaseName = videoId || createRequestId();
   const srtPath = path.join(CAPTIONS_DIR, `${srtBaseName}.srt`);
 
-  log("stream", `starting pipeline for ${videoUrl} (videoId=${videoId || "unknown"})`);
+  log(
+    "stream",
+    `starting pipeline for ${videoUrl} (videoId=${videoId || "unknown"})`,
+  );
 
   let failed = false;
   let ytDlpChild = null;
@@ -477,18 +575,31 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
   void (async () => {
     try {
       log("stream", "spawning yt-dlp (stdout mode)...");
-      ytDlpChild = spawn(BINARY_PATH, [
-        "-f", "bestaudio", "-o", "-", "--no-progress", videoUrl
-      ], { cwd: __dirname });
+      ytDlpChild = spawn(
+        BINARY_PATH,
+        ["-f", "bestaudio", "-o", "-", "--no-progress", videoUrl],
+        { cwd: __dirname },
+      );
 
       log("stream", "spawning ffmpeg (pipe:0 → pcm_s16le → pipe:1)...");
-      ffmpegChild = spawn("ffmpeg", [
-        "-i", "pipe:0",
-        "-vn", "-ac", "1",
-        "-ar", String(REALTIME_SAMPLE_RATE),
-        "-f", "s16le", "-acodec", "pcm_s16le",
-        "pipe:1"
-      ], { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] });
+      ffmpegChild = spawn(
+        "ffmpeg",
+        [
+          "-i",
+          "pipe:0",
+          "-vn",
+          "-ac",
+          "1",
+          "-ar",
+          String(REALTIME_SAMPLE_RATE),
+          "-f",
+          "s16le",
+          "-acodec",
+          "pcm_s16le",
+          "pipe:1",
+        ],
+        { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] },
+      );
 
       ytDlpChild.stdout.pipe(ffmpegChild.stdin);
       ffmpegChild.stdin.on("error", () => {});
@@ -517,9 +628,11 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       ytDlpChild.on("close", (code) => {
         log("stream", `yt-dlp exited with code ${code}`);
         if (code !== 0 && !failed) {
-          onError(new Error(
-            `yt-dlp exited with code ${code}.\n${ytDlpStderr || "No output."}`
-          ));
+          onError(
+            new Error(
+              `yt-dlp exited with code ${code}.\n${ytDlpStderr || "No output."}`,
+            ),
+          );
           teardown();
         }
       });
@@ -536,7 +649,7 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
       log("stream", "connecting to ElevenLabs realtime STT...");
       elWs = new WebSocket(wsUrl, {
-        headers: { "xi-api-key": apiKey }
+        headers: { "xi-api-key": apiKey },
       });
 
       let sessionStarted = false;
@@ -578,35 +691,45 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
             pcmBuffer = pcmBuffer.subarray(REALTIME_CHUNK_BYTES);
 
             if (elWs.readyState === WebSocket.OPEN) {
-              elWs.send(JSON.stringify({
-                message_type: "input_audio_chunk",
-                audio_base_64: chunk.toString("base64"),
-                commit: false,
-                sample_rate: REALTIME_SAMPLE_RATE
-              }));
+              elWs.send(
+                JSON.stringify({
+                  message_type: "input_audio_chunk",
+                  audio_base_64: chunk.toString("base64"),
+                  commit: false,
+                  sample_rate: REALTIME_SAMPLE_RATE,
+                }),
+              );
             }
 
             await sleep(REALTIME_SEND_DELAY_MS);
           }
         }
 
-        if (pcmBuffer.length > 0 && !failed && elWs.readyState === WebSocket.OPEN) {
-          elWs.send(JSON.stringify({
-            message_type: "input_audio_chunk",
-            audio_base_64: pcmBuffer.toString("base64"),
-            commit: false,
-            sample_rate: REALTIME_SAMPLE_RATE
-          }));
+        if (
+          pcmBuffer.length > 0 &&
+          !failed &&
+          elWs.readyState === WebSocket.OPEN
+        ) {
+          elWs.send(
+            JSON.stringify({
+              message_type: "input_audio_chunk",
+              audio_base_64: pcmBuffer.toString("base64"),
+              commit: false,
+              sample_rate: REALTIME_SAMPLE_RATE,
+            }),
+          );
         }
 
         if (!failed && elWs.readyState === WebSocket.OPEN) {
           finalCommitSent = true;
-          elWs.send(JSON.stringify({
-            message_type: "input_audio_chunk",
-            audio_base_64: "",
-            commit: true,
-            sample_rate: REALTIME_SAMPLE_RATE
-          }));
+          elWs.send(
+            JSON.stringify({
+              message_type: "input_audio_chunk",
+              audio_base_64: "",
+              commit: true,
+              sample_rate: REALTIME_SAMPLE_RATE,
+            }),
+          );
           scheduleFinish();
         }
       }
@@ -630,7 +753,10 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
         if (messageType === "session_started" && !sessionStarted) {
           sessionStarted = true;
-          log("stream", "ElevenLabs session started — streaming audio chunks...");
+          log(
+            "stream",
+            "ElevenLabs session started — streaming audio chunks...",
+          );
           drainFfmpegOutput().catch((err) => {
             if (!failed) {
               onError(err);
@@ -643,23 +769,41 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
         if (messageType === "committed_transcript_with_timestamps") {
           clearFinishTimer();
 
-          try {
-            const newCues = createSrtSegmentsFromRealtimeEvent(event);
-            const updated = insertSegmentsChronologically(segments, newCues);
-            segments.length = 0;
-            segments.push(...updated);
+          writeChain = writeChain.then(async () => {
+            try {
+              let newCues = createSrtSegmentsFromRealtimeEvent(event);
+              let preview = newCues
+                .map((c) => c.text.replace(/\n/g, " "))
+                .join(" | ");
+              log(
+                "ElevenLabs",
+                `Received | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
+              );
 
-            writeChain = writeChain.then(() =>
-              fs.writeFile(srtPath, buildSrtContent(segments), "utf8")
-            );
+              newCues = await sanitizeCuesWithGemini(segments, newCues);
 
-            const preview = newCues.map((c) => c.text.replace(/\n/g, " ")).join(" | ");
-            log("stream", `+${newCues.length} cue(s) (${segments.length} total): ${preview}`);
+              const updated = insertSegmentsChronologically(segments, newCues);
+              segments.length = 0;
+              segments.push(...updated);
 
-            onCues(newCues);
-          } catch (err) {
-            log("stream", `failed to process transcript event: ${err.message}`);
-          }
+              await fs.writeFile(srtPath, buildSrtContent(segments), "utf8");
+
+              preview = newCues
+                .map((c) => c.text.replace(/\n/g, " "))
+                .join(" | ");
+              log(
+                "gemini",
+                `Sanitized | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
+              );
+
+              onCues(newCues);
+            } catch (err) {
+              log(
+                "stream",
+                `failed to process transcript event: ${err.message}`,
+              );
+            }
+          });
 
           scheduleFinish();
           return;
@@ -695,12 +839,15 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
         writeChain
           .then(() => {
-            log("stream", `pipeline complete → ${path.basename(srtPath)} (${segments.length} segments)`);
+            log(
+              "stream",
+              `pipeline complete → ${path.basename(srtPath)} (${segments.length} segments)`,
+            );
             onDone({
               srtPath,
               srtFile: path.basename(srtPath),
               segmentCount: segments.length,
-              videoId
+              videoId,
             });
           })
           .catch((err) => onError(err));
@@ -744,7 +891,12 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
 
   if (!videoUrl || !isValidHttpUrl(videoUrl)) {
     log("ws", "rejected — missing or invalid url parameter");
-    clientWs.send(JSON.stringify({ type: "error", message: "Missing or invalid url parameter." }));
+    clientWs.send(
+      JSON.stringify({
+        type: "error",
+        message: "Missing or invalid url parameter.",
+      }),
+    );
     clientWs.close();
     return;
   }
@@ -756,10 +908,13 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
     const cached = await getCachedEntry(videoUrl);
 
     if (cached) {
-      log("cache", `hit for ${videoUrl} → ${cached.srtFile} (${cached.segmentCount} segments)`);
+      log(
+        "cache",
+        `hit for ${videoUrl} → ${cached.srtFile} (${cached.segmentCount} segments)`,
+      );
       const srtContent = await fs.readFile(
         path.join(CAPTIONS_DIR, cached.srtFile),
-        "utf8"
+        "utf8",
       );
       const cues = parseSrt(srtContent);
 
@@ -774,7 +929,10 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
       log("cache", `miss for ${videoUrl} — starting live transcription`);
     }
   } catch {
-    log("cache", `read error for ${videoUrl} — falling through to live transcription`);
+    log(
+      "cache",
+      `read error for ${videoUrl} — falling through to live transcription`,
+    );
   }
 
   let finished = false;
@@ -821,7 +979,7 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
         clientWs.send(JSON.stringify({ type: "error", message: err.message }));
         clientWs.close();
       }
-    }
+    },
   });
 
   clientWs.on("close", () => {
