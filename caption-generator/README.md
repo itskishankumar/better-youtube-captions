@@ -1,12 +1,11 @@
 # Caption Generator
 
-Small Node.js server for:
+Node.js server that streams realtime captions for YouTube videos to the companion Chrome extension. It:
 
-1. downloading best-audio from a video URL with `yt-dlp_macos`
-2. transcribing a saved audio file with ElevenLabs realtime speech-to-text
-3. writing a progressively updated `.srt` file beside the audio file
-4. **streaming realtime captions to the Chrome extension** via WebSocket (download + transcribe in a single pipeline)
-5. caching generated captions in `captions/` so repeat requests are served instantly
+1. downloads audio from a YouTube URL with `yt-dlp_macos`
+2. pipes the audio through `ffmpeg` into ElevenLabs realtime speech-to-text
+3. pushes subtitle cues to the Chrome extension over WebSocket as they arrive
+4. writes the final `.srt` file to disk and caches it so repeat requests are served instantly
 
 ## Requirements
 
@@ -56,95 +55,20 @@ The primary way the Chrome extension connects. Opens a WebSocket that:
 4. sends `{ "type": "done", "cached": true|false }` when finished
 5. writes the final `.srt` to `captions/<videoId>.srt` and updates `captions/captions.json`
 
-If the client disconnects, the server kills all child processes to avoid waste.
-
-## REST API (batch flow)
-
-The original REST endpoints are still available for manual / scripted use.
-
-### `POST /download`
-
-Downloads the best available audio stream for a video URL into this folder.
-
-Request:
-
-```json
-{
-  "url": "https://www.youtube.com/watch?v=..."
-}
-```
-
-Example:
-
-```bash
-curl -X POST http://localhost:8080/download \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://www.youtube.com/watch?v=..."}'
-```
-
-Response shape:
-
-```json
-{
-  "ok": true,
-  "requestId": "1774149168748-e7cf9cae",
-  "audioFile": "1774149168748-e7cf9cae.webm",
-  "audioPath": "/absolute/path/to/file.webm",
-  "ytDlpStdout": "...",
-  "ytDlpStderr": "..."
-}
-```
-
-### `POST /transcribe`
-
-Streams a local audio file to ElevenLabs realtime STT, then progressively rewrites the matching `.srt` file as committed transcript segments arrive.
-
-Request:
-
-```json
-{
-  "audioPath": "1774149168748-e7cf9cae.webm"
-}
-```
-
-`audioPath` must point to a file inside this project folder. It can be just a filename or a relative path inside the project.
-
-Example:
-
-```bash
-curl -X POST http://localhost:8080/transcribe \
-  -H "Content-Type: application/json" \
-  -d '{"audioPath":"1774149168748-e7cf9cae.webm"}'
-```
-
-Response shape:
-
-```json
-{
-  "ok": true,
-  "mode": "realtime",
-  "audioFile": "1774149168748-e7cf9cae.webm",
-  "audioPath": "/absolute/path/to/file.webm",
-  "srtFile": "1774149168748-e7cf9cae.srt",
-  "srtPath": "/absolute/path/to/file.srt",
-  "segmentCount": 123
-}
-```
+If the client disconnects mid-stream, the transcription pipeline continues to completion so the result is still cached for future requests.
 
 ## How Transcription Works
 
-Both the WebSocket streaming path and the `/transcribe` batch path use the same transcription logic:
+1. `yt-dlp` streams the best available audio to stdout
+2. `ffmpeg` converts it to mono PCM at 16 kHz (`pcm_s16le`) and pipes to stdout
+3. the server opens an ElevenLabs realtime WebSocket session (`scribe_v2_realtime`)
+4. PCM chunks are base64-encoded and sent to ElevenLabs in real time
+5. `committed_transcript_with_timestamps` events are converted into subtitle cues
+6. the `.srt` file is rewritten after each committed update
 
-1. converts the source audio to mono `pcm_16000` using `ffmpeg`
-2. opens an ElevenLabs realtime websocket session using `scribe_v2_realtime`
-3. streams the PCM audio in chunks
-4. listens for `committed_transcript_with_timestamps` events
-5. converts committed timestamped words into subtitle cues
-6. rewrites the full `.srt` file after each committed update
+All three stages run concurrently (`yt-dlp → ffmpeg → ElevenLabs`) so captions start arriving within seconds rather than waiting for a full download. No temporary files are written — audio is piped directly.
 
-The streaming path pipes `yt-dlp → ffmpeg → ElevenLabs` concurrently so captions start arriving within seconds rather than waiting for a full download.
-
-Each write is intended to be a valid full SRT file at that moment, not an append-only partial fragment.
+Each `.srt` write produces a complete, valid SRT file — not an append-only fragment.
 
 ## Caption Cache
 
@@ -152,14 +76,12 @@ Generated `.srt` files are stored in the `captions/` subfolder. A JSON index at 
 
 ## Notes
 
-- The server uses `commit_strategy=vad`, so subtitle updates happen when ElevenLabs decides a segment is final.
-- The server applies local cue splitting rules for subtitle readability based on punctuation, pauses, cue duration, and line length.
-- Temporary PCM files are created during batch transcription and deleted afterwards.
-- The streaming path does not write temporary files — audio is piped directly.
+- The server uses `commit_strategy=vad` with configurable silence and speech thresholds, so subtitle updates happen when ElevenLabs decides a segment is final.
+- Cue splitting rules enforce readability constraints: max 42 chars per line, max 84 chars per cue, max 6 s duration, and splits on punctuation or pauses.
 
 ## Files
 
-- `server.js`: HTTP server, WebSocket handler, and transcription pipelines
+- `server.js`: HTTP server, WebSocket handler, and streaming transcription pipeline
 - `captions/`: generated `.srt` files and `captions.json` cache index (gitignored)
 - `yt-dlp_macos`: local downloader binary
 - `.env`: local environment variables
