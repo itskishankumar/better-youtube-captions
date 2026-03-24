@@ -23,6 +23,9 @@ let generationState = {
   cueCount: 0,
   error: ""
 };
+let seekListener = null;
+let seekDebounceTimer = null;
+let coverageBarEl = null;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -161,6 +164,79 @@ function ensureOverlay() {
   }
 
   return true;
+}
+
+function ensureCoverageBar() {
+  const progressBar = document.querySelector(".ytp-progress-bar-container");
+  if (!progressBar || !progressBar.parentElement) return false;
+
+  if (!coverageBarEl) {
+    coverageBarEl = document.createElement("div");
+    coverageBarEl.id = "yt-srt-coverage-bar";
+    coverageBarEl.style.cssText = [
+      "position: absolute",
+      `top: ${progressBar.offsetTop + progressBar.offsetHeight}px`,
+      `left: ${progressBar.offsetLeft}px`,
+      `width: ${progressBar.offsetWidth}px`,
+      "height: 10px",
+      "background: rgba(255,255,255,0.08)",
+      "pointer-events: none",
+      "z-index: 10000",
+      "transition: opacity .3s",
+    ].join(";");
+    progressBar.parentElement.appendChild(coverageBarEl);
+  } else if (!coverageBarEl.isConnected) {
+    progressBar.parentElement.appendChild(coverageBarEl);
+  }
+
+  return true;
+}
+
+function updateCoverageBar() {
+  if (!ensureCoverageBar() || !videoEl) return;
+
+  const duration = videoEl.duration;
+  if (!duration || !Number.isFinite(duration) || duration <= 0) {
+    coverageBarEl.style.opacity = "0";
+    return;
+  }
+
+  if (cues.length === 0) {
+    coverageBarEl.innerHTML = "";
+    coverageBarEl.style.opacity = "0";
+    return;
+  }
+
+  // Merge cues into contiguous coverage ranges
+  const sorted = [...cues].sort((a, b) => a.start - b.start);
+  const ranges = [];
+  let cur = { start: sorted[0].start, end: sorted[0].end };
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].start <= cur.end + 0.5) {
+      cur.end = Math.max(cur.end, sorted[i].end);
+    } else {
+      ranges.push(cur);
+      cur = { start: sorted[i].start, end: sorted[i].end };
+    }
+  }
+  ranges.push(cur);
+
+  coverageBarEl.style.opacity = "1";
+  coverageBarEl.innerHTML = ranges
+    .map((r) => {
+      const left = ((r.start / duration) * 100).toFixed(3);
+      const width = (((r.end - r.start) / duration) * 100).toFixed(3);
+      return `<div style="position:absolute;top:0;height:100%;left:${left}%;width:${width}%;background:rgba(0,210,100,0.8);border-radius:1px;min-width:1px"></div>`;
+    })
+    .join("");
+}
+
+function removeCoverageBar() {
+  if (coverageBarEl) {
+    coverageBarEl.remove();
+    coverageBarEl = null;
+  }
 }
 
 function getSubtitlesButton() {
@@ -342,6 +418,19 @@ function startRendering() {
   enableSettingsSubtitleHiding();
   markSubtitlesSettingsMenuItems();
 
+  if (videoEl && !seekListener) {
+    seekListener = () => {
+      if (!generationWs || generationWs.readyState !== WebSocket.OPEN) return;
+
+      if (seekDebounceTimer) clearTimeout(seekDebounceTimer);
+      seekDebounceTimer = setTimeout(() => {
+        const ts = videoEl.currentTime;
+        generationWs.send(JSON.stringify({ type: "seek", timestamp: ts }));
+      }, 500);
+    };
+    videoEl.addEventListener("seeking", seekListener);
+  }
+
   if (!rafId) {
     rafId = requestAnimationFrame(renderLoop);
   }
@@ -361,6 +450,22 @@ function clearCustomCaptions() {
   showNativeCaptions();
   disableSettingsSubtitleHiding();
   stopRendering();
+
+  if (videoEl && seekListener) {
+    videoEl.removeEventListener("seeking", seekListener);
+    seekListener = null;
+  }
+  if (seekDebounceTimer) {
+    clearTimeout(seekDebounceTimer);
+    seekDebounceTimer = null;
+  }
+
+  if (generationWs) {
+    generationWs.close();
+    generationWs = null;
+  }
+
+  removeCoverageBar();
 
   captionSource = "";
   captionFileName = "";
@@ -387,6 +492,7 @@ function applySrtText(srtText, videoId) {
   currentVideoId = videoId;
   cues = parsed;
   startRendering();
+  updateCoverageBar();
 }
 
 async function loadStoredCaptionsForCurrentVideo() {
@@ -465,7 +571,11 @@ function startGeneration(serverUrl) {
   generationState = { active: true, status: "connecting", cueCount: 0, error: "" };
 
   const wsBase = (serverUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "");
-  const wsUrl = `${wsBase}/captions?url=${encodeURIComponent(window.location.href)}`;
+  const currentTime = videoEl ? Math.floor(videoEl.currentTime) : 0;
+  let wsUrl = `${wsBase}/captions?url=${encodeURIComponent(window.location.href)}`;
+  if (currentTime > 5) {
+    wsUrl += `&t=${currentTime}`;
+  }
 
   const ws = new WebSocket(wsUrl);
   generationWs = ws;
@@ -488,6 +598,12 @@ function startGeneration(serverUrl) {
       cues = insertCuesChronologically(cues, data.cues);
       generationState.cueCount = cues.length;
 
+      // Re-activate if cues arrive after a previous "done" (seek-triggered pipeline)
+      if (!generationState.active) {
+        generationState.active = true;
+        generationState.status = "receiving";
+      }
+
       if (!videoEl || !rafId) {
         try {
           startRendering();
@@ -495,28 +611,32 @@ function startGeneration(serverUrl) {
           // Ignore if video element is not available yet.
         }
       }
+
+      updateCoverageBar();
     }
 
     if (data.type === "done") {
       generationState.active = false;
       generationState.status = data.cached ? "done_cached" : "done";
       captionSource = "server";
-      generationWs = null;
       saveGeneratedSrt();
+
+      if (data.cached) {
+        // Cached data fully delivered — close WS, no pipelines to keep alive
+        if (generationWs === ws) generationWs = null;
+        ws.close();
+      }
     }
 
     if (data.type === "error") {
       generationState.active = false;
       generationState.status = "error";
       generationState.error = data.message || "Server error.";
-      generationWs = null;
     }
   });
 
   ws.addEventListener("error", () => {
-    if (generationWs !== ws) {
-      return;
-    }
+    if (generationWs !== ws) return;
 
     generationState.active = false;
     generationState.status = "error";
@@ -525,13 +645,10 @@ function startGeneration(serverUrl) {
   });
 
   ws.addEventListener("close", () => {
-    if (generationWs === ws) {
-      generationWs = null;
+    if (generationWs !== ws) return;
 
-      if (generationState.active) {
-        generationState.active = false;
-      }
-    }
+    generationWs = null;
+    generationState.active = false;
   });
 }
 

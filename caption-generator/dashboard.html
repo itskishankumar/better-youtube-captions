@@ -59,26 +59,48 @@
     color: #5cb8ff;
     margin-bottom: 8px;
   }
-  .job-row {
+  .job-entry {
+    margin-bottom: 12px;
+  }
+  .job-entry:last-child { margin-bottom: 0; }
+  .job-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: space-between;
     font-size: 13px;
     color: #8cbfe6;
-    margin-bottom: 4px;
+    margin-bottom: 6px;
   }
-  .job-progress-bar {
-    flex: 1;
-    height: 6px;
+  .job-header a {
+    color: #5cb8ff;
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .job-header a:hover { text-decoration: underline; }
+  .job-header .job-meta { color: #6a9fc0; }
+  .job-timeline {
+    position: relative;
+    width: 100%;
+    height: 10px;
     background: #1c3040;
-    border-radius: 3px;
+    border-radius: 5px;
     overflow: hidden;
   }
-  .job-progress-fill {
+  .job-timeline-seg {
+    position: absolute;
+    top: 0;
     height: 100%;
     background: #4a9eff;
-    border-radius: 3px;
-    transition: width .4s ease;
+    border-radius: 2px;
+    min-width: 2px;
+    transition: left .3s ease, width .3s ease;
+  }
+  .job-timeline-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #4a7a9a;
+    margin-top: 3px;
   }
 
   /* Section heading */
@@ -283,17 +305,28 @@ async function refresh() {
     if (jobEntries.length > 0) {
       jobsBanner.classList.add("visible");
       document.getElementById("jobs-list").innerHTML = jobEntries
-        .map(([videoId, job]) => {
-          const pct = job.segmentsTotal
-            ? Math.round((job.segmentsDone / job.segmentsTotal) * 100)
-            : 0;
+        .map(([vid, job]) => {
+          const ytUrl = `https://www.youtube.com/watch?v=${vid}`;
+          const dur = job.duration || 1;
+          const segs = (job.coverage || [])
+            .map((r) => {
+              const left = ((r.start / dur) * 100).toFixed(2);
+              const width = (((r.end - r.start) / dur) * 100).toFixed(2);
+              return `<div class="job-timeline-seg" style="left:${left}%;width:${width}%"></div>`;
+            })
+            .join("");
+
           return `
-            <div class="job-row">
-              <span>${videoId}</span>
-              <div class="job-progress-bar">
-                <div class="job-progress-fill" style="width:${pct}%"></div>
+            <div class="job-entry">
+              <div class="job-header">
+                <a href="${ytUrl}" target="_blank" rel="noopener">${vid}</a>
+                <span class="job-meta">${job.segmentCount} cues &middot; ${job.activePipelines} pipeline${job.activePipelines !== 1 ? "s" : ""}</span>
               </div>
-              <span>${job.segmentsDone}/${job.segmentsTotal}</span>
+              <div class="job-timeline">${segs}</div>
+              <div class="job-timeline-label">
+                <span>0:00</span>
+                <span>${formatDuration(dur)}</span>
+              </div>
             </div>
           `;
         })
@@ -325,6 +358,7 @@ async function refresh() {
 }
 
 refresh();
+setInterval(refresh, 2000);
 </script>
 </body>
 </html>

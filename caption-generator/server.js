@@ -29,7 +29,7 @@ const CAPTIONS_DIR = path.join(__dirname, "captions");
 const CACHE_FILE = path.join(CAPTIONS_DIR, "captions.json");
 const serverStartTime = Date.now();
 let activeConnectionCount = 0;
-const activeJobs = new Map(); // videoId → { segmentsDone, segmentsTotal }
+const activeJobs = new Map(); // videoId → { segments, activePipelines }
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -90,6 +90,8 @@ function sleep(ms) {
     setTimeout(resolve, ms);
   });
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Captions cache
@@ -452,6 +454,29 @@ function insertSegmentsChronologically(existingSegments, newSegments) {
   });
 }
 
+function computeCoverageRanges(segments) {
+  if (!segments || segments.length === 0) {
+    return { ranges: [], duration: 0 };
+  }
+
+  const sorted = [...segments].sort((a, b) => a.start - b.start);
+  const ranges = [];
+  let cur = { start: sorted[0].start, end: sorted[0].end };
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].start <= cur.end + 0.5) {
+      cur.end = Math.max(cur.end, sorted[i].end);
+    } else {
+      ranges.push({ start: cur.start, end: cur.end });
+      cur = { start: sorted[i].start, end: sorted[i].end };
+    }
+  }
+
+  ranges.push({ start: cur.start, end: cur.end });
+
+  return { ranges, duration: ranges[ranges.length - 1].end };
+}
+
 // ---------------------------------------------------------------------------
 // Gemini Sanity Pass
 // ---------------------------------------------------------------------------
@@ -529,30 +554,30 @@ const ELEVENLABS_ERROR_TYPES = new Set([
   "insufficient_audio_activity",
 ]);
 
-function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
+function streamTranscribeFromUrl(
+  videoUrl,
+  { onCues, onDone, onError, onDuration, startTimestamp = 0, getContextSegments },
+) {
   const apiKey = process.env.ELEVENLABS_API_KEY;
 
   if (!apiKey) {
     process.nextTick(() =>
       onError(new Error("ELEVENLABS_API_KEY is not set.")),
     );
-    return;
+    return { teardown() {} };
   }
 
   const videoId = extractVideoId(videoUrl);
-  const srtBaseName = videoId || createRequestId();
-  const srtPath = path.join(CAPTIONS_DIR, `${srtBaseName}.srt`);
 
   log(
     "stream",
-    `starting pipeline for ${videoUrl} (videoId=${videoId || "unknown"})`,
+    `starting pipeline for ${videoUrl} (videoId=${videoId || "unknown"}, t=${startTimestamp}s)`,
   );
 
   let failed = false;
   let ytDlpChild = null;
   let ffmpegChild = null;
   let elWs = null;
-  const segments = [];
   let writeChain = Promise.resolve();
 
   function teardown() {
@@ -578,32 +603,35 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
   void (async () => {
     try {
-      log("stream", "spawning yt-dlp (stdout mode)...");
+      log("stream", `spawning yt-dlp (t=${startTimestamp}s)...`);
       ytDlpChild = spawn(
         BINARY_PATH,
         ["-f", "bestaudio", "-o", "-", "--no-progress", videoUrl],
         { cwd: __dirname },
       );
 
-      log("stream", "spawning ffmpeg (pipe:0 → pcm_s16le → pipe:1)...");
-      ffmpegChild = spawn(
-        "ffmpeg",
-        [
-          "-i",
-          "pipe:0",
-          "-vn",
-          "-ac",
-          "1",
-          "-ar",
-          String(REALTIME_SAMPLE_RATE),
-          "-f",
-          "s16le",
-          "-acodec",
-          "pcm_s16le",
-          "pipe:1",
-        ],
-        { cwd: __dirname, stdio: ["pipe", "pipe", "pipe"] },
+      const ffmpegArgs = ["-i", "pipe:0"];
+      if (startTimestamp > 0) {
+        ffmpegArgs.push("-ss", String(startTimestamp));
+      }
+      ffmpegArgs.push(
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        String(REALTIME_SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "pipe:1",
       );
+
+      log("stream", "spawning ffmpeg (pipe:0 → pcm_s16le → pipe:1)...");
+      ffmpegChild = spawn("ffmpeg", ffmpegArgs, {
+        cwd: __dirname,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
 
       ytDlpChild.stdout.pipe(ffmpegChild.stdin);
       ffmpegChild.stdin.on("error", () => {});
@@ -611,6 +639,21 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       let ytDlpStderr = "";
       ytDlpChild.stderr.on("data", (chunk) => {
         ytDlpStderr += chunk.toString();
+      });
+
+      let durationReported = false;
+      ffmpegChild.stderr.on("data", (chunk) => {
+        if (durationReported || !onDuration) return;
+        const match = chunk.toString().match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
+        if (match) {
+          durationReported = true;
+          const dur =
+            Number(match[1]) * 3600 +
+            Number(match[2]) * 60 +
+            Number(match[3]) +
+            Number(match[4]) / 100;
+          if (dur > 0) onDuration(dur);
+        }
       });
 
       ytDlpChild.on("error", (err) => {
@@ -774,32 +817,40 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
           clearFinishTimer();
 
           writeChain = writeChain.then(async () => {
+            if (failed) return;
+
             try {
               let newCues = createSrtSegmentsFromRealtimeEvent(event);
+
+              if (startTimestamp > 0) {
+                newCues = newCues.map((cue) => ({
+                  start: cue.start + startTimestamp,
+                  end: cue.end + startTimestamp,
+                  text: cue.text,
+                }));
+              }
+
               let preview = newCues
                 .map((c) => c.text.replace(/\n/g, " "))
                 .join(" | ");
               log(
                 "elevenLabs",
-                `Received | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
+                `Received | +${newCues.length} cue(s): ${preview}`,
               );
 
               if (gemini) {
-                newCues = await sanitizeCuesWithGemini(segments, newCues);
+                const context = getContextSegments
+                  ? getContextSegments()
+                  : [];
+                newCues = await sanitizeCuesWithGemini(context, newCues);
                 preview = newCues
                   .map((c) => c.text.replace(/\n/g, " "))
                   .join(" | ");
                 log(
                   "gemini",
-                  `Sanitized | +${newCues.length} cue(s) (${segments.length} total): ${preview}`,
+                  `Sanitized | +${newCues.length} cue(s): ${preview}`,
                 );
               }
-
-              const updated = insertSegmentsChronologically(segments, newCues);
-              segments.length = 0;
-              segments.push(...updated);
-
-              await fs.writeFile(srtPath, buildSrtContent(segments), "utf8");
 
               onCues(newCues);
             } catch (err) {
@@ -844,16 +895,8 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
 
         writeChain
           .then(() => {
-            log(
-              "stream",
-              `pipeline complete → ${path.basename(srtPath)} (${segments.length} segments)`,
-            );
-            onDone({
-              srtPath,
-              srtFile: path.basename(srtPath),
-              segmentCount: segments.length,
-              videoId,
-            });
+            log("stream", `pipeline complete (t=${startTimestamp}s)`);
+            onDone({ videoId });
           })
           .catch((err) => onError(err));
       });
@@ -865,6 +908,8 @@ function streamTranscribeFromUrl(videoUrl, { onCues, onDone, onError }) {
       teardown();
     }
   })();
+
+  return { teardown };
 }
 
 // ---------------------------------------------------------------------------
@@ -901,10 +946,21 @@ const server = http.createServer(async (req, res) => {
   // API: server status
   if (req.method === "GET" && req.url === "/api/status") {
     const cache = await loadCache();
+    const jobs = {};
+    for (const [id, job] of activeJobs) {
+      const coverage = computeCoverageRanges(job.segments);
+      const duration = job.videoDuration || coverage.duration || 1;
+      jobs[id] = {
+        activePipelines: job.activePipelines,
+        segmentCount: job.segments.length,
+        coverage: coverage.ranges,
+        duration,
+      };
+    }
     sendJson(res, 200, {
       uptime: Math.floor((Date.now() - serverStartTime) / 1000),
       activeConnections: activeConnectionCount,
-      activeJobs: Object.fromEntries(activeJobs),
+      activeJobs: jobs,
       totalCachedVideos: Object.keys(cache).length,
     });
     return;
@@ -957,6 +1013,7 @@ const wss = new WebSocket.Server({ noServer: true });
 
 async function handleCaptionWebSocket(clientWs, requestUrl) {
   const videoUrl = requestUrl.searchParams.get("url");
+  const initialTimestamp = Number(requestUrl.searchParams.get("t")) || 0;
 
   if (!videoUrl || !isValidHttpUrl(videoUrl)) {
     log("ws", "rejected — missing or invalid url parameter");
@@ -971,11 +1028,157 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
   }
 
   const videoId = extractVideoId(videoUrl);
-  log("ws", `connected — videoId=${videoId || "unknown"} url=${videoUrl}`);
+  const jobKey = videoId || "unknown";
+  log("ws", `connected — videoId=${jobKey} url=${videoUrl}`);
 
   activeConnectionCount++;
-  clientWs.on("close", () => { activeConnectionCount--; });
 
+  // --- shared state across all pipelines for this connection ---
+  const segments = [];
+  const srtBaseName = videoId || createRequestId();
+  const srtPath = path.join(CAPTIONS_DIR, `${srtBaseName}.srt`);
+  const activePipelines = new Set();
+  let seekDebounceTimer = null;
+
+  const jobState = { segments, activePipelines: 0, videoDuration: 0 };
+  activeJobs.set(jobKey, jobState);
+
+  const COVERAGE_TOLERANCE_S = 2;
+  let nextPipelineNum = 0;
+
+  function isCoveredByOtherPipeline(t, excludePid) {
+    return segments.some(
+      (s) =>
+        s._pid !== excludePid &&
+        t >= s.start - COVERAGE_TOLERANCE_S &&
+        t <= s.end + COVERAGE_TOLERANCE_S,
+    );
+  }
+
+  function isTimeCovered(t) {
+    return segments.some(
+      (s) => t >= s.start - COVERAGE_TOLERANCE_S && t <= s.end + COVERAGE_TOLERANCE_S,
+    );
+  }
+
+  function writeSrt() {
+    return fs.writeFile(srtPath, buildSrtContent(segments), "utf8");
+  }
+
+  function updateJobState() {
+    jobState.activePipelines = activePipelines.size;
+  }
+
+  function onPipelineCompleted() {
+    activeJobs.delete(jobKey);
+
+    writeSrt()
+      .then(() =>
+        addCacheEntry(
+          videoUrl,
+          videoId,
+          path.basename(srtPath),
+          segments.length,
+        ),
+      )
+      .then(() => {
+        log(
+          "cache",
+          `saved ${path.basename(srtPath)} (${segments.length} segments)`,
+        );
+      })
+      .catch((err) => {
+        log("cache", `failed to save: ${err.message}`);
+      });
+
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: "done", cached: false }));
+    }
+
+    log("ws", `pipeline completed — ${segments.length} segments total`);
+  }
+
+  function startPipeline(seekTimestamp) {
+    const pipelineId = Symbol();
+    const pid = ++nextPipelineNum;
+    let pipelineEnded = false;
+
+    function endPipeline(reason) {
+      if (pipelineEnded) return;
+      pipelineEnded = true;
+      activePipelines.delete(pipelineId);
+      updateJobState();
+
+      if (activePipelines.size === 0 && reason !== "error" && segments.length > 0) {
+        onPipelineCompleted();
+      }
+    }
+
+    const handle = streamTranscribeFromUrl(videoUrl, {
+      startTimestamp: seekTimestamp,
+      getContextSegments: () => segments.slice(-3),
+      onDuration(dur) {
+        if (!jobState.videoDuration) {
+          jobState.videoDuration = dur;
+          log("ws", `video duration: ${dur}s`);
+        }
+      },
+
+      onCues(newCues) {
+        // Check coverage only against segments from OTHER pipelines
+        const uncovered = newCues.filter(
+          (cue) => !isCoveredByOtherPipeline(cue.start, pid),
+        );
+
+        if (uncovered.length > 0) {
+          // Tag cues with this pipeline's ID
+          for (const cue of uncovered) {
+            cue._pid = pid;
+          }
+
+          segments.push(...uncovered);
+          segments.sort((a, b) =>
+            a.start !== b.start ? a.start - b.start : a.end - b.end,
+          );
+
+          writeSrt().catch(() => {});
+
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "cues", cues: uncovered }));
+          }
+        }
+
+        // Only stop when ALL cues are covered by OTHER pipelines
+        if (uncovered.length === 0) {
+          log(
+            "stream",
+            `pipeline from ${seekTimestamp}s hit covered territory, stopping`,
+          );
+          handle.teardown();
+          endPipeline("coverage");
+        }
+      },
+
+      onDone() {
+        endPipeline("completed");
+      },
+
+      onError(err) {
+        log("ws", `pipeline error (t=${seekTimestamp}s): ${err.message}`);
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(
+            JSON.stringify({ type: "error", message: err.message }),
+          );
+        }
+        endPipeline("error");
+      },
+    });
+
+    activePipelines.add(pipelineId);
+    updateJobState();
+  }
+
+  // --- check cache before starting any pipelines ---
   try {
     const cached = await getCachedEntry(videoUrl);
 
@@ -991,8 +1194,11 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
       const cues = parseSrt(srtContent);
 
       if (cues.length > 0 && clientWs.readyState === WebSocket.OPEN) {
+        segments.push(...cues);
         clientWs.send(JSON.stringify({ type: "cues", cues }));
         clientWs.send(JSON.stringify({ type: "done", cached: true }));
+        activeJobs.delete(jobKey);
+        activeConnectionCount--;
         clientWs.close();
         log("ws", `sent ${cues.length} cached cues and closed`);
         return;
@@ -1007,63 +1213,38 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
     );
   }
 
-  let finished = false;
+  // --- listen for seek messages from the client ---
+  clientWs.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
 
-  activeJobs.set(videoId || "unknown", { segmentsDone: 0, segmentsTotal: 0 });
+      if (msg.type === "seek" && typeof msg.timestamp === "number") {
+        if (seekDebounceTimer) clearTimeout(seekDebounceTimer);
 
-  streamTranscribeFromUrl(videoUrl, {
-    onCues(newCues) {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: "cues", cues: newCues }));
+        seekDebounceTimer = setTimeout(() => {
+          if (isTimeCovered(msg.timestamp)) {
+            log("ws", `seek to ${msg.timestamp}s — already covered`);
+            return;
+          }
+
+          log("ws", `seek to ${msg.timestamp}s — starting new pipeline`);
+          startPipeline(msg.timestamp);
+        }, 500);
       }
-
-      const job = activeJobs.get(videoId || "unknown");
-      if (job) job.segmentsDone++;
-    },
-
-    onDone({ srtFile, segmentCount, videoId: vid }) {
-      if (finished) {
-        return;
-      }
-
-      finished = true;
-      activeJobs.delete(vid || "unknown");
-
-      addCacheEntry(videoUrl, vid, srtFile, segmentCount)
-        .then(() => {
-          log("cache", `saved ${srtFile} (${segmentCount} segments)`);
-        })
-        .catch((err) => {
-          log("cache", `failed to save: ${err.message}`);
-        });
-
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: "done", cached: false }));
-        clientWs.close();
-      }
-
-      log("ws", `done — sent ${segmentCount} segments total`);
-    },
-
-    onError(err) {
-      if (finished) {
-        return;
-      }
-
-      finished = true;
-      activeJobs.delete(videoId || "unknown");
-      log("ws", `error: ${err.message}`);
-
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: "error", message: err.message }));
-        clientWs.close();
-      }
-    },
+    } catch {
+      /* ignore malformed messages */
+    }
   });
 
+  // --- start initial pipeline ---
+  startPipeline(initialTimestamp);
+
   clientWs.on("close", () => {
-    if (!finished) {
-      log("ws", "client disconnected — pipeline will continue to completion");
+    activeConnectionCount--;
+    if (seekDebounceTimer) clearTimeout(seekDebounceTimer);
+
+    if (activePipelines.size > 0) {
+      log("ws", "client disconnected — pipelines will continue to completion");
     }
   });
 }
