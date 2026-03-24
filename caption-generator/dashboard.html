@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Better YouTube Captions — Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0f0f0f;
+    color: #e8e8e8;
+    line-height: 1.5;
+  }
+
+  header {
+    background: #181818;
+    border-bottom: 1px solid #2a2a2a;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: #fff;
+  }
+
+  .status-pills {
+    display: flex;
+    gap: 12px;
+  }
+  .pill {
+    font-size: 13px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    background: #252525;
+    color: #aaa;
+  }
+  .pill strong { color: #fff; }
+  .pill.active { background: #1a3a1a; color: #4caf50; }
+
+  main { max-width: 1100px; margin: 24px auto; padding: 0 24px; }
+
+  /* Active jobs banner */
+  .jobs-banner {
+    background: #1a2733;
+    border: 1px solid #234;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 20px;
+    display: none;
+  }
+  .jobs-banner.visible { display: block; }
+  .jobs-banner h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #5cb8ff;
+    margin-bottom: 8px;
+  }
+  .job-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: #8cbfe6;
+    margin-bottom: 4px;
+  }
+  .job-progress-bar {
+    flex: 1;
+    height: 6px;
+    background: #1c3040;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .job-progress-fill {
+    height: 100%;
+    background: #4a9eff;
+    border-radius: 3px;
+    transition: width .4s ease;
+  }
+
+  /* Section heading */
+  .section-heading {
+    font-size: 15px;
+    font-weight: 600;
+    color: #aaa;
+    margin-bottom: 14px;
+  }
+  .section-heading span { color: #fff; }
+
+  /* Video grid */
+  .video-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 16px;
+  }
+
+  .video-card {
+    background: #181818;
+    border: 1px solid #2a2a2a;
+    border-radius: 10px;
+    overflow: hidden;
+    transition: border-color .15s;
+  }
+  .video-card:hover { border-color: #444; }
+
+  .video-thumb {
+    width: 100%;
+    aspect-ratio: 16/9;
+    object-fit: cover;
+    display: block;
+    background: #222;
+  }
+
+  .card-body { padding: 12px 14px; }
+  .card-body .video-id {
+    font-size: 13px;
+    color: #aaa;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .card-body .video-id a {
+    color: #5cb8ff;
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .card-body .video-id a:hover { text-decoration: underline; }
+
+  /* Coverage bar */
+  .coverage-bar {
+    position: relative;
+    width: 100%;
+    height: 8px;
+    background: #252525;
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0;
+  }
+  .coverage-seg {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    background: rgba(0, 210, 100, 0.8);
+    border-radius: 2px;
+  }
+
+  .card-stats {
+    display: flex;
+    gap: 14px;
+    font-size: 12px;
+    color: #888;
+    margin-top: 6px;
+  }
+  .card-stats strong { color: #ccc; }
+
+  .card-actions { margin-top: 10px; }
+  .btn-delete {
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid #533;
+    background: transparent;
+    color: #e55;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+  }
+  .btn-delete:hover { background: #3a1a1a; color: #f77; }
+
+  .empty-state {
+    text-align: center;
+    color: #555;
+    padding: 60px 20px;
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Better YouTube Captions</h1>
+  <div class="status-pills">
+    <div class="pill" id="pill-uptime">Uptime: <strong>—</strong></div>
+    <div class="pill" id="pill-connections">Connections: <strong>0</strong></div>
+    <div class="pill" id="pill-videos">Videos: <strong>0</strong></div>
+  </div>
+</header>
+
+<main>
+  <div class="jobs-banner" id="jobs-banner">
+    <h3>Active Transcriptions</h3>
+    <div id="jobs-list"></div>
+  </div>
+
+  <div class="section-heading">Cached Transcripts (<span id="video-count">0</span>)</div>
+  <div class="video-grid" id="video-grid"></div>
+  <div class="empty-state" id="empty-state" style="display:none">No cached transcripts yet.</div>
+</main>
+
+<script>
+const API_BASE = "http://localhost:8080";
+
+function formatUptime(secs) {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function formatDuration(secs) {
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function relativeTime(isoString) {
+  if (!isoString) return "—";
+  const diff = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function renderVideoCard(video) {
+  const ytUrl = `https://www.youtube.com/watch?v=${video.videoId}`;
+  const thumbUrl = `https://i.ytimg.com/vi/${video.videoId}/hqdefault.jpg`;
+
+  return `
+    <div class="video-card" data-video-id="${video.videoId}">
+      <a href="${ytUrl}" target="_blank" rel="noopener">
+        <img class="video-thumb" src="${thumbUrl}" alt="${video.videoId}" loading="lazy" />
+      </a>
+      <div class="card-body">
+        <div class="video-id">
+          <a href="${ytUrl}" target="_blank" rel="noopener">${video.videoId}</a>
+          <span>${relativeTime(video.createdAt)}</span>
+        </div>
+        <div class="card-stats">
+          <span><strong>${video.totalCues}</strong> cues</span>
+          <span>${video.srtFile}</span>
+        </div>
+        <div class="card-actions">
+          <button class="btn-delete" onclick="deleteVideo('${video.videoId}')">Delete</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function deleteVideo(videoId) {
+  if (!confirm(`Delete all cached captions for ${videoId}?`)) return;
+  try {
+    await fetch(`${API_BASE}/api/videos/${videoId}`, { method: "DELETE" });
+    refresh();
+  } catch { /* ignore */ }
+}
+
+async function refresh() {
+  try {
+    const [statusRes, videosRes] = await Promise.all([
+      fetch(`${API_BASE}/api/status`),
+      fetch(`${API_BASE}/api/videos`),
+    ]);
+    const status = await statusRes.json();
+    const videos = await videosRes.json();
+
+    // Status pills
+    document.querySelector("#pill-uptime strong").textContent = formatUptime(status.uptime);
+    document.querySelector("#pill-connections strong").textContent = status.activeConnections;
+    document.querySelector("#pill-videos strong").textContent = status.totalCachedVideos;
+
+    const connPill = document.getElementById("pill-connections");
+    connPill.classList.toggle("active", status.activeConnections > 0);
+
+    // Active jobs
+    const jobsBanner = document.getElementById("jobs-banner");
+    const jobEntries = Object.entries(status.activeJobs || {});
+    if (jobEntries.length > 0) {
+      jobsBanner.classList.add("visible");
+      document.getElementById("jobs-list").innerHTML = jobEntries
+        .map(([videoId, job]) => {
+          const pct = job.segmentsTotal
+            ? Math.round((job.segmentsDone / job.segmentsTotal) * 100)
+            : 0;
+          return `
+            <div class="job-row">
+              <span>${videoId}</span>
+              <div class="job-progress-bar">
+                <div class="job-progress-fill" style="width:${pct}%"></div>
+              </div>
+              <span>${job.segmentsDone}/${job.segmentsTotal}</span>
+            </div>
+          `;
+        })
+        .join("");
+    } else {
+      jobsBanner.classList.remove("visible");
+    }
+
+    // Video grid
+    const grid = document.getElementById("video-grid");
+    const empty = document.getElementById("empty-state");
+    const count = document.getElementById("video-count");
+
+    const sorted = videos
+      .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+
+    count.textContent = sorted.length;
+
+    if (sorted.length === 0) {
+      grid.innerHTML = "";
+      empty.style.display = "block";
+    } else {
+      empty.style.display = "none";
+      grid.innerHTML = sorted.map(renderVideoCard).join("");
+    }
+  } catch {
+    // Network error — silently retry next cycle.
+  }
+}
+
+refresh();
+</script>
+</body>
+</html>

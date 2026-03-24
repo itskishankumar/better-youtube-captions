@@ -27,6 +27,9 @@ const SRT_MAX_CUE_DURATION_S = 6;
 const SRT_PAUSE_SPLIT_S = 0.7;
 const CAPTIONS_DIR = path.join(__dirname, "captions");
 const CACHE_FILE = path.join(CAPTIONS_DIR, "captions.json");
+const serverStartTime = Date.now();
+let activeConnectionCount = 0;
+const activeJobs = new Map(); // videoId → { segmentsDone, segmentsTotal }
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -45,7 +48,7 @@ function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
   });
   res.end(JSON.stringify(payload));
@@ -879,6 +882,70 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Admin dashboard
+  if (req.method === "GET" && req.url === "/dashboard") {
+    try {
+      const html = await fs.readFile(
+        path.join(__dirname, "dashboard.html"),
+        "utf8",
+      );
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(html);
+    } catch {
+      res.writeHead(500);
+      res.end("dashboard.html not found");
+    }
+    return;
+  }
+
+  // API: server status
+  if (req.method === "GET" && req.url === "/api/status") {
+    const cache = await loadCache();
+    sendJson(res, 200, {
+      uptime: Math.floor((Date.now() - serverStartTime) / 1000),
+      activeConnections: activeConnectionCount,
+      activeJobs: Object.fromEntries(activeJobs),
+      totalCachedVideos: Object.keys(cache).length,
+    });
+    return;
+  }
+
+  // API: list cached videos
+  if (req.method === "GET" && req.url === "/api/videos") {
+    const cache = await loadCache();
+    const videos = Object.values(cache).map((entry) => ({
+      videoId: entry.videoId,
+      videoUrl: entry.videoUrl,
+      srtFile: entry.srtFile,
+      totalCues: entry.segmentCount || 0,
+      createdAt: entry.createdAt || null,
+    }));
+    sendJson(res, 200, videos);
+    return;
+  }
+
+  // API: delete a cached video
+  const deleteMatch = req.url.match(/^\/api\/videos\/([a-zA-Z0-9_-]+)$/);
+  if (req.method === "DELETE" && deleteMatch) {
+    try {
+      const videoId = deleteMatch[1];
+      const cache = await loadCache();
+      const toDelete = Object.entries(cache).find(
+        ([, v]) => v.videoId === videoId,
+      );
+      if (toDelete) {
+        const srtPath = path.join(CAPTIONS_DIR, toDelete[1].srtFile);
+        await fs.rm(srtPath, { force: true });
+        delete cache[toDelete[0]];
+        await saveCache(cache);
+      }
+      sendJson(res, 200, { ok: true });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
   sendJson(res, 404, { error: "Not found." });
 });
 
@@ -905,6 +972,9 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
 
   const videoId = extractVideoId(videoUrl);
   log("ws", `connected — videoId=${videoId || "unknown"} url=${videoUrl}`);
+
+  activeConnectionCount++;
+  clientWs.on("close", () => { activeConnectionCount--; });
 
   try {
     const cached = await getCachedEntry(videoUrl);
@@ -939,11 +1009,16 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
 
   let finished = false;
 
+  activeJobs.set(videoId || "unknown", { segmentsDone: 0, segmentsTotal: 0 });
+
   streamTranscribeFromUrl(videoUrl, {
     onCues(newCues) {
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({ type: "cues", cues: newCues }));
       }
+
+      const job = activeJobs.get(videoId || "unknown");
+      if (job) job.segmentsDone++;
     },
 
     onDone({ srtFile, segmentCount, videoId: vid }) {
@@ -952,6 +1027,7 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
       }
 
       finished = true;
+      activeJobs.delete(vid || "unknown");
 
       addCacheEntry(videoUrl, vid, srtFile, segmentCount)
         .then(() => {
@@ -975,6 +1051,7 @@ async function handleCaptionWebSocket(clientWs, requestUrl) {
       }
 
       finished = true;
+      activeJobs.delete(videoId || "unknown");
       log("ws", `error: ${err.message}`);
 
       if (clientWs.readyState === WebSocket.OPEN) {
